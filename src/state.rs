@@ -1,9 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  CYPHER PREDICTION MARKET — ON-CHAIN STATE
 //
-//  Supports two market types in one unified program:
-//    1. YesNo   — binary outcome, variable bet sizes
-//    2. Accuracy — numeric estimate, fixed entry fee, median-error split
+//  Supports three market types in one unified program:
+//    1. YesNo        — binary outcome, variable bet sizes
+//    2. MultiOutcome — N outcomes (up to 10), variable bet sizes, parimutuel
+//    3. Accuracy     — numeric estimate, fixed entry fee, median-error split
 //
 //  Account hierarchy:
 //    Protocol (singleton)
@@ -21,6 +22,14 @@
 /// Placeholder for solana_program::pubkey::Pubkey (32 bytes)
 pub type Pubkey = [u8; 32];
 
+/// Maximum number of outcomes in a multi-outcome market.
+/// Fixed at 10 so the Market account stays a known size on-chain.
+/// Outcome labels are stored as short strings (max 32 bytes each).
+pub const MAX_OUTCOMES: usize = 10;
+
+/// Max bytes per outcome label (e.g. "Ethereum", "Solana")
+pub const MAX_OUTCOME_LABEL_LEN: usize = 32;
+
 // ─────────────────────────────────────────────────────────────────────────
 //  ENUMS
 // ─────────────────────────────────────────────────────────────────────────
@@ -28,6 +37,7 @@ pub type Pubkey = [u8; 32];
 #[derive(Clone, Debug, PartialEq)]
 pub enum MarketType {
     YesNo,
+    MultiOutcome,
     Accuracy,
 }
 
@@ -141,6 +151,35 @@ pub enum MarketData {
         winning_side: Option<Side>,
     },
 
+    /// Multi-outcome parimutuel market (from flew.rs MultiMarket logic)
+    ///
+    /// Creator defines N outcomes (2..=10). Users pick one outcome and bet
+    /// any amount. Same fee split as YesNo. Winning outcome's bettors
+    /// split ALL other pools proportional to their net bet.
+    ///
+    /// Payout = (net_bet / winning_pool) × sum_of_all_losing_pools
+    ///
+    /// On-chain we use fixed-size arrays sized to MAX_OUTCOMES (10).
+    /// Unused slots are zeroed out. `outcome_count` says how many are active.
+    MultiOutcome {
+        /// How many outcomes are active (2..=MAX_OUTCOMES)
+        outcome_count: u8,
+        /// Outcome labels — fixed array, first `outcome_count` are valid
+        /// Each label is a short string (max 32 bytes).
+        /// On-chain stored as [[u8; MAX_OUTCOME_LABEL_LEN]; MAX_OUTCOMES]
+        /// with a length prefix per label. Here we use String for readability.
+        outcome_labels: Vec<String>,
+        /// Net pool per outcome — pools[i] is the net amount for outcome i
+        /// Fixed array on-chain: [u64; MAX_OUTCOMES]
+        pools: Vec<u64>,
+        /// Accumulated LP fees (go to creator)
+        lp_fee_pool: u64,
+        /// Accumulated protocol fees (go to treasury)
+        protocol_fee_pool: u64,
+        /// Index of the winning outcome (0..outcome_count-1), set on settlement
+        winning_outcome: Option<u8>,
+    },
+
     /// Numeric accuracy market (from trepa.rs logic)
     ///
     /// Each player pays a fixed entry fee and submits an estimate.
@@ -229,6 +268,20 @@ pub enum BetData {
         protocol_fee: u64,
     },
 
+    /// Bet on a Multi-Outcome market
+    MultiOutcome {
+        /// Which outcome this bet is on (0..outcome_count-1)
+        outcome_id: u8,
+        /// Full amount the user deposited
+        total_amount: u64,
+        /// Amount after fees (this goes into the pool)
+        net_amount: u64,
+        /// LP fee portion
+        lp_fee: u64,
+        /// Protocol fee portion
+        protocol_fee: u64,
+    },
+
     /// Bet on an Accuracy market
     Accuracy {
         /// The player's numeric estimate (scaled integer)
@@ -272,27 +325,58 @@ pub const MAX_QUESTION_LEN: usize = 200;
 /// Protocol account size (with 8-byte Anchor discriminator)
 pub const PROTOCOL_SIZE: usize = 8 + 1 + 32 + 32 + 2 + 8; // = 83
 
-/// Market account size (YesNo variant, max question)
+/// Shared Market header size (common fields before market_data)
 /// 8 (disc) + 1 (bump) + 32 (creator) + 8 (index) + 1 (type) + 1 (status)
 /// + 4+200 (string) + 8 (bond) + 2+2 (fees) + 8+8 (timestamps)
-/// + 8 (total_bets) + 32 (vault) + 32 (mint) + MarketData
-/// YesNo MarketData: 1 (enum tag) + 8+8+8+8 (pools) + 1+1 (Option<Side>)
-pub const MARKET_YESNO_SIZE: usize = 8 + 1 + 32 + 8 + 1 + 1 + (4 + MAX_QUESTION_LEN)
-    + 8 + 2 + 2 + 8 + 8 + 8 + 32 + 32 + 1 + 8 + 8 + 8 + 8 + 2;
-// = 8 + 375 = ~383 bytes
+/// + 8 (total_bets) + 32 (vault) + 32 (mint)
+const MARKET_HEADER_SIZE: usize = 8 + 1 + 32 + 8 + 1 + 1 + (4 + MAX_QUESTION_LEN)
+    + 8 + 2 + 2 + 8 + 8 + 8 + 32 + 32;
+// = 359 bytes
 
-/// Accuracy MarketData is larger: entry_fee, pools, counts, optional fields
-pub const MARKET_ACCURACY_SIZE: usize = 8 + 1 + 32 + 8 + 1 + 1 + (4 + MAX_QUESTION_LEN)
-    + 8 + 2 + 2 + 8 + 8 + 8 + 32 + 32 + 1 + 8 + 8 + 8 + 8 + 4 + 4 + 9 + 1 + 9 + 9 + 1;
-// = 8 + ~420 = ~428 bytes
+/// Market account size (YesNo variant)
+/// Header + enum tag(1) + yes_pool(8) + no_pool(8) + lp_fee_pool(8)
+/// + protocol_fee_pool(8) + Option<Side>(1+1)
+pub const MARKET_YESNO_SIZE: usize = MARKET_HEADER_SIZE + 1 + 8 + 8 + 8 + 8 + 2;
+// = ~394 bytes
+
+/// Market account size (MultiOutcome variant — largest because of fixed arrays)
+/// Header + enum tag(1) + outcome_count(1)
+/// + labels: 10 × (4 + 32) = 360  (Borsh Vec<String>: 4-byte len prefix + 32 bytes each)
+/// + pools: 10 × 8 = 80
+/// + lp_fee_pool(8) + protocol_fee_pool(8) + Option<u8>(1+1)
+pub const MARKET_MULTI_SIZE: usize = MARKET_HEADER_SIZE + 1 + 1
+    + (4 + MAX_OUTCOMES * (4 + MAX_OUTCOME_LABEL_LEN))
+    + (4 + MAX_OUTCOMES * 8)
+    + 8 + 8 + 2;
+// = 359 + 464 = ~823 bytes
+
+/// Market account size (Accuracy variant)
+/// Header + enum tag(1) + entry_fee(8) + total_pool(8) + loser_pool(8)
+/// + protocol_take(8) + prize_pool(8) + winner_count(4) + loser_count(4)
+/// + Option<u64> outcome(9) + decimals(1) + Option<u64> median(9)
+/// + Option<u64> total_weight(9) + weight_scale(1)
+pub const MARKET_ACCURACY_SIZE: usize = MARKET_HEADER_SIZE + 1 + 8 + 8 + 8 + 8 + 8
+    + 4 + 4 + 9 + 1 + 9 + 9 + 1;
+// = 359 + 79 = ~438 bytes
+
+/// Shared Bet header size (common fields before bet_data)
+/// 8 (disc) + 1 (bump) + 32 (bettor) + 32 (market) + 8 (index) + 8 (created_at) + 1 (claimed)
+const BET_HEADER_SIZE: usize = 8 + 1 + 32 + 32 + 8 + 8 + 1;
+// = 90 bytes
 
 /// Bet account size (YesNo variant)
-/// 8 (disc) + 1 + 32 + 32 + 8 + 8 + 1 + BetData
-/// YesNo BetData: 1 + 1 + 8+8+8+8 = 34
-pub const BET_YESNO_SIZE: usize = 8 + 1 + 32 + 32 + 8 + 8 + 1 + 1 + 1 + 8 + 8 + 8 + 8;
-// = ~128 bytes
+/// Header + enum tag(1) + side(1) + total(8) + net(8) + lp(8) + proto(8)
+pub const BET_YESNO_SIZE: usize = BET_HEADER_SIZE + 1 + 1 + 8 + 8 + 8 + 8;
+// = ~124 bytes
+
+/// Bet account size (MultiOutcome variant)
+/// Header + enum tag(1) + outcome_id(1) + total(8) + net(8) + lp(8) + proto(8)
+pub const BET_MULTI_SIZE: usize = BET_HEADER_SIZE + 1 + 1 + 8 + 8 + 8 + 8;
+// = ~124 bytes
 
 /// Bet account size (Accuracy variant)
-/// Accuracy BetData: 1 + 8+1+8 + 9+9+9+2+9 = 56
-pub const BET_ACCURACY_SIZE: usize = 8 + 1 + 32 + 32 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 9 + 9 + 9 + 2 + 9;
-// = ~148 bytes
+/// Header + enum tag(1) + estimate(8) + decimals(1) + entry_fee(8)
+/// + Option<u64> error(9) + Option<u64> rel_err(9) + Option<u64> weight(9)
+/// + Option<bool> won(2) + Option<u64> payout(9)
+pub const BET_ACCURACY_SIZE: usize = BET_HEADER_SIZE + 1 + 8 + 1 + 8 + 9 + 9 + 9 + 2 + 9;
+// = ~146 bytes
