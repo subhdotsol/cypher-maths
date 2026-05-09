@@ -18,17 +18,27 @@ One Solana program. Three market types. Bets encrypted via Arcium until settleme
 
 **Protocol** — singleton, created once on deploy
 ```
+Owner:     Cypher Program
+Authority: Protocol.authority (admin wallet) — can update fees, set treasury, void markets
+Payer:     Admin (pays rent on deploy)
+
 bump: u8
-authority: Pubkey              // admin wallet
+authority: Pubkey              // admin wallet — THE top-level authority
 treasury: Pubkey               // fee collection wallet
 default_protocol_fee_bps: u16  // e.g. 50 = 0.50%
 market_count: u64              // auto-increment, assigns market indexes
 ```
+- **Who can mutate:** only `initialize_protocol` (init), `create_market` (increments market_count)
+- **Authority powers:** void any market, update fees, change treasury address
 
 **Market** — one per market (or one per tier in tiered lobbies)
 ```
+Owner:     Cypher Program
+Authority: Market.creator — the wallet that created this market
+Payer:     Creator (pays rent at creation)
+
 bump: u8
-creator: Pubkey
+creator: Pubkey                // creator wallet — can lock, settle, withdraw bond+fees
 market_index: u64
 market_type: MarketType        // YesNo | MultiOutcome | Accuracy
 category: MarketCategory       // Crypto | Politics | Sports | Tech | Economy | Culture | Beyond
@@ -45,24 +55,58 @@ token_mint: Pubkey
 market_group: Option<Pubkey>   // None for standalone, Some for tiered
 market_data: MarketData        // YesNo{...} | MultiOutcome{...} | Accuracy{...}
 ```
+- **Who can mutate:**
+  - `create_market` → init
+  - `place_bet` → increments total_bets, updates market_data pools (encrypted)
+  - `lock_market` → creator or permissionless crank (after deadline) → sets status = Locked
+  - `settle_market` → oracle/creator → sets winning outcome, pools, status = Settled
+  - `void_market` → Protocol.authority ONLY → sets status = Voided
+- **Creator powers:** lock market, settle market (provide outcome), withdraw bond + LP fees
+- **Creator CANNOT:** void market (only Protocol.authority can), claim other people's bets
 
-**Vault** — standard SPL token account, PDA-owned by the program. Holds all deposited tokens for a market.
+**Vault** — SPL token account, holds all deposited tokens for one market
+```
+Owner:     SPL Token Program
+Authority: Cypher Program PDA (program-derived signer) — ONLY the program can move tokens out
+Payer:     Creator (pays rent at market creation)
+PDA:       ["vault", market.key()]
+```
+- **Who can move tokens IN:** anyone (standard SPL transfer — bettors deposit, creator deposits bond)
+- **Who can move tokens OUT:** ONLY the Cypher program via PDA signing:
+  - `claim` → program signs transfer to winner
+  - `withdraw_creator` → program signs transfer to creator
+  - `claim` (voided) → program signs refund to bettor
+- **No human wallet has authority over the Vault.** The program PDA is the sole signer.
 
 **Bet** — one per individual bet placed
 ```
+Owner:     Cypher Program
+Authority: Bet.bettor — the wallet that placed this bet
+Payer:     Bettor (pays rent at bet placement, reclaimable after claim)
+
 bump: u8
-bettor: Pubkey
+bettor: Pubkey                 // bettor wallet — can claim payout or refund
 market: Pubkey
 bet_index: u64
 created_at: i64
 claimed: bool
 bet_data: BetData              // YesNo{...} | MultiOutcome{...} | Accuracy{...}
 ```
+- **Who can mutate:**
+  - `place_bet` → init (creates the Bet account)
+  - `settle_market` (accuracy only) → crank writes error, weight, won fields
+  - `claim` → bettor sets claimed = true, receives payout
+- **Bettor powers:** claim payout (if winner), claim refund (if voided)
+- **Bettor CANNOT:** modify bet after placement, cancel bet, claim someone else's bet
 
 **MarketGroup** — links tiered accuracy markets to one shared outcome
 ```
+Owner:     Cypher Program
+Authority: MarketGroup.creator — same wallet that created the tiered lobby
+Payer:     Creator (pays rent at creation)
+
 bump: u8
-creator: Pubkey
+creator: Pubkey                // creator wallet
 group_index: u64
 question: String
 resolution_deadline: i64
@@ -75,31 +119,66 @@ outcome_value: Option<u64>     // set once at settlement, shared by all tiers
 outcome_decimals: u8
 settled: bool
 ```
+- **Who can mutate:**
+  - `create_market` (with tiers) → init
+  - `settle_market` → oracle/creator sets outcome_value, then marks settled = true after all tiers done
+- **Creator powers:** same as Market creator — provides outcome for settlement
+
+### Ownership & Authority Summary
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         AUTHORITY HIERARCHY                          │
+│                                                                      │
+│  Protocol.authority (admin)                                          │
+│    │                                                                 │
+│    ├── Can: void ANY market, update fees, change treasury            │
+│    ├── Cannot: place bets, claim payouts, create markets (as admin)  │
+│    │                                                                 │
+│    ▼                                                                 │
+│  Market.creator (per market)                                         │
+│    │                                                                 │
+│    ├── Can: lock market, settle market, withdraw bond + LP fees      │
+│    ├── Cannot: void market, modify bets, claim other's payouts       │
+│    │                                                                 │
+│    ▼                                                                 │
+│  Bet.bettor (per bet)                                                │
+│    │                                                                 │
+│    ├── Can: claim OWN payout (winner) or refund (voided)             │
+│    ├── Cannot: modify/cancel bet, claim others, settle market        │
+│    │                                                                 │
+│    ▼                                                                 │
+│  Vault — NO human authority                                          │
+│    Program PDA is sole signer. Tokens only move via program logic.   │
+│    No admin, creator, or bettor can directly withdraw from Vault.    │
+└──────────────────────────────────────────────────────────────────────┘
+
+Account Owner (on-chain Solana owner field):
+  Protocol    → Cypher Program
+  Market      → Cypher Program
+  MarketGroup → Cypher Program
+  Bet         → Cypher Program
+  Vault       → SPL Token Program (token authority = Cypher Program PDA)
+```
 
 ---
 
-## Instructions — 14 total
+## Instructions — 8 total
 
-| # | Instruction | Who Calls | When | Market Types |
-|---|-------------|-----------|------|--------------|
-| 1 | `initialize_protocol` | Admin | Once on deploy | — |
-| 2 | `create_market` | Creator | To open a new market | YesNo, Multi, Accuracy |
-| 3 | `create_tiered_market` | Creator | To open a tiered lobby | Accuracy only |
-| 4 | `place_bet_yesno` | Bettor | While market is Open | YesNo |
-| 5 | `place_bet_multi` | Bettor | While market is Open | MultiOutcome |
-| 6 | `place_bet_accuracy` | Bettor | While market is Open | Accuracy |
-| 7 | `lock_market` | Creator / Crank | At resolution_deadline | All |
-| 8 | `settle_yesno` | Oracle / Creator | After lock | YesNo |
-| 9 | `settle_multi` | Oracle / Creator | After lock | MultiOutcome |
-| 10 | `settle_accuracy_step` | Crank bot | After lock (multi-tx) | Accuracy |
-| 11 | `settle_group` | Oracle / Creator | After lock | Tiered Accuracy |
-| 12 | `claim` | Winner | After settlement | All |
-| 13 | `withdraw_creator` | Creator | After settlement | All |
-| 14 | `void_market` | Authority | Emergency | All |
+| # | Instruction | Who Calls | When |
+|---|-------------|-----------|------|
+| 1 | `initialize_protocol` | Admin | Once on deploy |
+| 2 | `create_market` | Creator | To open any market type |
+| 3 | `place_bet` | Bettor | While market is Open |
+| 4 | `lock_market` | Creator / Crank | At resolution_deadline |
+| 5 | `settle_market` | Oracle / Crank | After lock |
+| 6 | `claim` | Winner | After settlement |
+| 7 | `withdraw_creator` | Creator | After settlement |
+| 8 | `void_market` | Authority | Emergency |
 
-### Instruction Details
+---
 
-#### 1. `initialize_protocol`
+### 1. `initialize_protocol`
 
 ```
 Signer:   admin
@@ -110,95 +189,141 @@ Creates Protocol PDA. Sets authority = admin, market_count = 0.
 Called once. Fails if Protocol already exists.
 ```
 
-#### 2. `create_market`
+---
+
+### 2. `create_market`
+
+One instruction, branches by `market_type`. If Accuracy + tiers provided, creates a tiered lobby.
 
 ```
 Signer:   creator
-Accounts: [Protocol (mut), Market (init), Vault (init), token_mint, creator_token_account]
-Args:     question: String, market_type: MarketType, category: MarketCategory,
-          bond: u64, lp_fee_bps: u16, deadline: i64, outcomes: Option<Vec<String>>
+Accounts:
+  Always:     [Protocol (mut), Market (init), Vault (init), token_mint, creator_token_account]
+  If tiered:  [MarketGroup (init), Market×N (init), Vault×N (init)]  // up to 4 tiers
 
-Flow:
-  1. Read Protocol.market_count → market_index
-  2. Increment Protocol.market_count
-  3. Init Market PDA with all fields, status = Open
-  4. Init Vault PDA (SPL token account, authority = program PDA)
-  5. Transfer bond from creator → Vault
-  6. If MultiOutcome → validate 2..=10 outcomes, init pools to [0; N]
-  7. If Accuracy → set entry_fee from args
-  8. Emit MarketCreated event
+Args:
+  question: String              // max 200 bytes
+  market_type: MarketType       // YesNo | MultiOutcome | Accuracy
+  category: MarketCategory
+  bond: u64
+  lp_fee_bps: u16
+  deadline: i64
+  market_params: CreateMarketParams   // enum — type-specific args
 ```
 
-#### 3. `create_tiered_market`
+```rust
+enum CreateMarketParams {
+    YesNo,
+    // no extra args — just two pools
 
-```
-Signer:   creator
-Accounts: [Protocol (mut), MarketGroup (init), Market×4 (init), Vault×4 (init),
-           token_mint, creator_token_account]
-Args:     question: String, bond: u64, deadline: i64,
-          tiers: Vec<(String, u64)>  // (label, entry_fee) — up to 4
+    MultiOutcome {
+        outcomes: Vec<String>,      // 2..=10 labels, each ≤32 bytes
+    },
 
-Flow:
-  1. Init MarketGroup PDA
-  2. For each tier: init Market PDA (Accuracy type), init Vault PDA
-  3. Link each Market.market_group → MarketGroup
-  4. Store tier_markets[] in MarketGroup
-  5. Transfer bond → each Vault (or single bond in group)
-  6. Emit TieredMarketCreated event
-```
+    Accuracy {
+        entry_fee: u64,
+        tiers: Option<Vec<TierConfig>>,  // None = standalone, Some = tiered lobby
+    },
+}
 
-#### 4. `place_bet_yesno`
-
-```
-Signer:   bettor
-Accounts: [Market (mut), Bet (init), Vault (mut), bettor_token_account]
-Args:     side: Side, amount: u64
-
-Flow:
-  1. Require Market.status == Open
-  2. Compute: lp_fee, protocol_fee, net_amount
-  3. ARCIUM: encrypt (side, net_amount) → store encrypted_bet on Bet account
-  4. Transfer amount → Vault
-  5. Market.total_bets += 1 (public counter only — pools stay hidden)
-  6. Init Bet PDA with encrypted bet_data
-  7. Emit BetPlaced event (bettor, market, amount — side is NOT revealed)
+struct TierConfig {
+    label: String,      // "Bronze", "Silver", etc.
+    entry_fee: u64,     // in token base units
+}
 ```
 
-#### 5. `place_bet_multi`
-
+**Flow — standalone (YesNo / Multi / Accuracy without tiers):**
 ```
-Signer:   bettor
-Accounts: [Market (mut), Bet (init), Vault (mut), bettor_token_account]
-Args:     outcome_id: u8, amount: u64
-
-Flow:
-  1. Require Market.status == Open, outcome_id < outcome_count
-  2. Compute fees, net_amount
-  3. ARCIUM: encrypt (outcome_id, net_amount) → encrypted_bet
-  4. Transfer amount → Vault
-  5. Market.total_bets += 1
-  6. Init Bet PDA with encrypted bet_data
-  7. Emit BetPlaced event (bettor, market, amount — outcome NOT revealed)
+1. Read Protocol.market_count → market_index
+2. Protocol.market_count += 1
+3. Init Market PDA: status = Open, market_data based on type
+4. Init Vault PDA (SPL token account, authority = program PDA)
+5. Transfer bond from creator → Vault
+6. match market_params:
+     YesNo       → market_data = YesNo { yes_pool: 0, no_pool: 0, ... }
+     MultiOutcome → validate 2..=10 outcomes, market_data = MultiOutcome { pools: [0; N], ... }
+     Accuracy     → market_data = Accuracy { entry_fee, total_pool: 0, ... }
+7. Emit MarketCreated
 ```
 
-#### 6. `place_bet_accuracy`
+**Flow — tiered (Accuracy + tiers provided):**
+```
+1. Init MarketGroup PDA
+2. For each tier (up to 4):
+     a. Protocol.market_count → index, Protocol.market_count += 1
+     b. Init Market PDA (Accuracy type), set market_group = Some(group_key)
+     c. Init Vault PDA
+3. Store tier_markets[] in MarketGroup
+4. Transfer bond → Vaults
+5. Emit MarketCreated (one event per tier market + one for the group)
+```
+
+---
+
+### 3. `place_bet`
+
+One instruction. Reads `market.market_type` to know what the bettor is doing.
 
 ```
 Signer:   bettor
-Accounts: [Market (mut), Bet (init), Vault (mut), bettor_token_account]
-Args:     estimate: u64
+Accounts: [Market (mut), Bet (init), Vault (mut), bettor_token_account, Arcium accounts]
 
-Flow:
-  1. Require Market.status == Open
-  2. Read entry_fee from Market.market_data
-  3. ARCIUM: encrypt (estimate) → encrypted_estimate on Bet account
-  4. Transfer entry_fee → Vault
-  5. Market.total_bets += 1, market_data.total_pool += entry_fee
-  6. Init Bet PDA with encrypted bet_data
-  7. Emit BetPlaced event (bettor, market — estimate NOT revealed)
+Args:
+  bet_params: PlaceBetParams    // enum — what the bettor is submitting
 ```
 
-#### 7. `lock_market`
+```rust
+enum PlaceBetParams {
+    YesNo {
+        side: Side,         // Yes or No
+        amount: u64,
+    },
+
+    MultiOutcome {
+        outcome_id: u8,     // which outcome (0..N-1)
+        amount: u64,
+    },
+
+    Accuracy {
+        estimate: u64,      // the player's numeric prediction
+    },
+}
+```
+
+**Flow (all types):**
+```
+1. Require Market.status == Open
+2. Require bet_params variant matches Market.market_type
+     (can't submit YesNo bet to an Accuracy market)
+3. match bet_params:
+
+     YesNo { side, amount }:
+       a. Compute: lp_fee, protocol_fee, net_amount
+       b. ARCIUM: encrypt (side, net_amount) → ciphertext stored on Bet
+       c. Transfer amount → Vault
+       d. Bet.bet_data = YesNo { side: encrypted, amounts... }
+
+     MultiOutcome { outcome_id, amount }:
+       a. Require outcome_id < market_data.outcome_count
+       b. Compute fees, net_amount
+       c. ARCIUM: encrypt (outcome_id, net_amount) → ciphertext
+       d. Transfer amount → Vault
+       e. Bet.bet_data = MultiOutcome { outcome_id: encrypted, amounts... }
+
+     Accuracy { estimate }:
+       a. Read entry_fee from market_data
+       b. ARCIUM: encrypt (estimate) → ciphertext
+       c. Transfer entry_fee → Vault
+       d. market_data.total_pool += entry_fee
+       e. Bet.bet_data = Accuracy { estimate: encrypted, entry_fee }
+
+4. Market.total_bets += 1
+5. Emit BetPlaced (bettor, market_index, bet_index, amount — choice NOT revealed)
+```
+
+---
+
+### 4. `lock_market`
 
 ```
 Signer:   creator or permissionless crank
@@ -208,152 +333,211 @@ Args:     none
 Flow:
   1. Require current_time >= resolution_deadline
   2. Require Market.status == Open
-  3. Set Market.status = Locked
-  4. Emit MarketLocked event
+  3. Market.status = Locked
+  4. Emit MarketLocked
 ```
 
-#### 8. `settle_yesno`
+For tiered lobbies: call `lock_market` on each tier's Market individually. Same instruction, called N times.
+
+---
+
+### 5. `settle_market`
+
+One instruction. Branches by `market.market_type`. Accuracy uses multi-step cranking internally.
 
 ```
-Signer:   oracle / creator
-Accounts: [Market (mut), all Bet accounts for this market, Arcium MPC accounts]
-Args:     winning_side: Side
+Signer:   oracle / creator / crank
+Accounts:
+  Always:      [Market (mut), Arcium MPC accounts]
+  If accuracy: [batch of Bet accounts (mut)]
+  If tiered:   [MarketGroup (mut)]
 
-Flow:
-  1. Require Market.status == Locked
-  2. ARCIUM: trigger MPC computation →
-     a. Decrypt all encrypted bets
+Args:
+  settle_params: SettleMarketParams
+```
+
+```rust
+enum SettleMarketParams {
+    YesNo {
+        winning_side: Side,
+    },
+
+    MultiOutcome {
+        winning_outcome_id: u8,
+    },
+
+    Accuracy {
+        step: AccuracySettleStep,
+    },
+}
+
+enum AccuracySettleStep {
+    SetOutcome { outcome_value: u64, outcome_decimals: u8 },
+    ComputeErrors,          // cranked — processes N bets per tx
+    ComputeWeights,         // cranked — processes N bets per tx
+    Finalize,
+}
+```
+
+**Flow — YesNo (single tx):**
+```
+1. Require Market.status == Locked
+2. ARCIUM MPC:
+     a. Decrypt all encrypted bets for this market
      b. Compute yes_pool, no_pool, lp_fee_pool, protocol_fee_pool
-     c. Post decrypted pool totals back on-chain (verified by MPC nodes)
-  3. Set market_data.winning_side = winning_side
-  4. Set Market.status = Settled
-  5. Emit MarketSettled event (winning_side, yes_pool, no_pool)
+     c. Post verified pool totals on-chain
+3. market_data.winning_side = winning_side
+4. Market.status = Settled
+5. Emit MarketSettled (winning_side, yes_pool, no_pool — pools now public)
 ```
 
-#### 9. `settle_multi`
-
+**Flow — MultiOutcome (single tx):**
 ```
-Signer:   oracle / creator
-Accounts: [Market (mut), all Bet accounts, Arcium MPC accounts]
-Args:     winning_outcome_id: u8
-
-Flow:
-  1. Require Market.status == Locked, winning_outcome_id < outcome_count
-  2. ARCIUM: trigger MPC computation →
+1. Require Market.status == Locked, winning_outcome_id < outcome_count
+2. ARCIUM MPC:
      a. Decrypt all encrypted bets
      b. Compute pools[0..N], lp_fee_pool, protocol_fee_pool
-     c. Post decrypted pool totals on-chain
-  3. If pools[winning_outcome_id] == 0 → void market (no winners)
-  4. Set market_data.winning_outcome = winning_outcome_id
-  5. Set Market.status = Settled
-  6. Emit MarketSettled event (winning_outcome, pools)
+     c. Post verified pool totals on-chain
+3. If pools[winning_outcome_id] == 0 → void market (nobody bet on winner)
+4. market_data.winning_outcome = winning_outcome_id
+5. Market.status = Settled
+6. Emit MarketSettled (winning_outcome, pools)
 ```
 
-#### 10. `settle_accuracy_step`
-
+**Flow — Accuracy (cranked, multiple txs):**
 ```
-Signer:   crank bot
-Accounts: [Market (mut), batch of Bet accounts, Arcium MPC accounts]
-Args:     step: AccuracySettleStep  // SetOutcome | ComputeErrors | ComputeWeights | Finalize
+Step A — SetOutcome (1 tx):
+  1. If market has market_group → read outcome_value from MarketGroup
+     (oracle calls settle_market on the group first to set shared outcome)
+     If standalone → use outcome_value from args
+  2. market_data.outcome_value = outcome_value
 
-Flow (multi-tx, cranked):
-  Step A — SetOutcome:
-    1. Set market_data.outcome_value from oracle
-  Step B — ComputeErrors (cranked, N bets per tx):
-    1. ARCIUM: decrypt estimates in batch
-    2. Compute error = |estimate - outcome| for each
-    3. After all processed → compute median_error
-  Step C — ComputeWeights (cranked, N bets per tx):
-    1. For each bet: relative_error = error / median_error
-    2. weight = (1/(1+r))^6 (integer math)
-    3. Mark won = true/false on each Bet
-    4. Accumulate total_weight
-  Step D — Finalize:
-    1. loser_pool = loser_count * entry_fee
-    2. protocol_take = loser_pool * protocol_fee_bps / 10000
-    3. prize_pool = loser_pool - protocol_take
-    4. Market.status = Settled
-    5. Emit MarketSettled event
-```
+Step B — ComputeErrors (cranked, N bets per tx):
+  1. ARCIUM: decrypt estimates in this batch
+  2. For each Bet: error = |estimate - outcome_value|
+  3. Store error on each Bet account
+  4. After ALL bets processed → compute median_error
+  5. market_data.median_error = median
 
-#### 11. `settle_group`
+Step C — ComputeWeights (cranked, N bets per tx):
+  1. For each Bet:
+       relative_error = error / median_error
+       weight = (1/(1+r))^6 (integer math with scaling)
+       if error < median → won = true, else won = false
+  2. Accumulate total_weight
+  3. Set winner_count, loser_count on market_data
 
-```
-Signer:   oracle / creator
-Accounts: [MarketGroup (mut)]
-Args:     outcome_value: u64, outcome_decimals: u8
-
-Flow:
-  1. Set MarketGroup.outcome_value = outcome_value
-  2. Each tier Market then settles independently via settle_accuracy_step
-     using this shared outcome_value
-  3. After all tiers settled → MarketGroup.settled = true
-  4. Emit GroupSettled event
+Step D — Finalize (1 tx):
+  1. loser_pool = loser_count * entry_fee
+  2. protocol_take = loser_pool * protocol_fee_bps / 10000
+  3. prize_pool = loser_pool - protocol_take
+  4. Market.status = Settled
+  5. Emit MarketSettled
 ```
 
-#### 12. `claim`
-
+**Tiered lobby settlement — same instruction, called in order:**
 ```
-Signer:   winner (bettor)
-Accounts: [Market, Bet (mut), Vault (mut), bettor_token_account, treasury]
-Args:     none
-
-Flow:
-  1. Require Market.status == Settled, Bet.claimed == false
-  2. Compute payout based on market type:
-     YesNo:  payout = (net_amount / winning_pool) * losing_pool + net_amount
-     Multi:  same formula, losing_pool = total - winning_pool
-     Accuracy: payout = (weight / total_weight) * prize_pool + entry_fee
-  3. Transfer payout from Vault → bettor
-  4. Transfer proportional protocol_fee from Vault → treasury
-  5. Set Bet.claimed = true
-  6. Emit PayoutClaimed event
-```
-
-#### 13. `withdraw_creator`
-
-```
-Signer:   creator
-Accounts: [Market, Vault (mut), creator_token_account]
-Args:     none
-
-Flow:
-  1. Require Market.status == Settled, caller == Market.creator
-  2. YesNo/Multi: transfer creator_bond + lp_fee_pool from Vault → creator
-  3. Accuracy: transfer creator_bond from Vault → creator (no LP fees)
-  4. Emit CreatorWithdrawal event
-```
-
-#### 14. `void_market`
-
-```
-Signer:   authority (Protocol.authority)
-Accounts: [Protocol, Market (mut)]
-Args:     none
-
-Flow:
-  1. Require caller == Protocol.authority
-  2. Set Market.status = Voided
-  3. Now anyone can call claim_refund → returns full deposit to each bettor
-  4. Returns bond to creator
-  5. Emit MarketVoided event
+1. settle_market on MarketGroup → sets shared outcome_value
+2. settle_market(Accuracy::SetOutcome) on each tier → reads from group
+3. settle_market(Accuracy::ComputeErrors) on each tier → cranked
+4. settle_market(Accuracy::ComputeWeights) on each tier → cranked
+5. settle_market(Accuracy::Finalize) on each tier
+6. After all tiers done → MarketGroup.settled = true
 ```
 
 ---
 
-## Events — 8 total
+### 6. `claim`
+
+```
+Signer:   bettor
+Accounts: [Market (read), Bet (mut), Vault (mut), bettor_token_account, treasury]
+Args:     none
+
+Flow:
+  1. Require Market.status == Settled (or Voided for refund)
+  2. Require Bet.claimed == false
+
+  3. If Market.status == Voided:
+       → refund: transfer full deposit back to bettor
+       → skip to step 5
+
+  4. match market_data:
+       YesNo:
+         if bet side != winning_side → error NotAWinner
+         payout = net_amount + (net_amount / winning_pool) * losing_pool
+         protocol_share = proportional protocol_fee
+
+       MultiOutcome:
+         if bet outcome_id != winning_outcome → error NotAWinner
+         winning_pool = pools[winning_outcome]
+         losing_pool = sum(all pools) - winning_pool
+         payout = net_amount + (net_amount / winning_pool) * losing_pool
+         protocol_share = proportional protocol_fee
+
+       Accuracy:
+         if won != true → error NotAWinner
+         payout = entry_fee + (weight / total_weight) * prize_pool
+
+  5. Transfer payout from Vault → bettor
+  6. Transfer protocol_share from Vault → treasury (if not voided)
+  7. Bet.claimed = true
+  8. Emit PayoutClaimed
+```
+
+---
+
+### 7. `withdraw_creator`
+
+```
+Signer:   creator
+Accounts: [Market (read), Vault (mut), creator_token_account]
+Args:     none
+
+Flow:
+  1. Require Market.status == Settled or Voided
+  2. Require caller == Market.creator
+
+  3. match market_data:
+       YesNo / MultiOutcome:
+         transfer = creator_bond + lp_fee_pool
+       Accuracy:
+         transfer = creator_bond (no LP fees in accuracy)
+
+  4. Transfer from Vault → creator
+  5. Emit CreatorWithdrawal
+```
+
+---
+
+### 8. `void_market`
+
+```
+Signer:   authority (Protocol.authority)
+Accounts: [Protocol (read), Market (mut)]
+Args:     none
+
+Flow:
+  1. Require caller == Protocol.authority
+  2. Market.status = Voided
+  3. Bettors now call `claim` → gets refund (full deposit back)
+  4. Creator calls `withdraw_creator` → gets bond back
+  5. Emit MarketVoided
+```
+
+---
+
+## Events — 7 total
 
 | # | Event | Emitted By | Fields |
 |---|-------|-----------|--------|
-| 1 | `MarketCreated` | `create_market` | market_index, market_type, category, creator, question, deadline, bond |
-| 2 | `TieredMarketCreated` | `create_tiered_market` | group_index, question, tier_count, tier_labels, tier_entry_fees, tier_market_indexes |
-| 3 | `BetPlaced` | `place_bet_*` | market_index, bet_index, bettor, amount (side/outcome/estimate **NOT** emitted — encrypted) |
-| 4 | `MarketLocked` | `lock_market` | market_index, locked_at |
-| 5 | `MarketSettled` | `settle_*` | market_index, winning_side/outcome (pools revealed post-decryption) |
-| 6 | `GroupSettled` | `settle_group` | group_index, outcome_value |
-| 7 | `PayoutClaimed` | `claim` | market_index, bet_index, bettor, payout_amount |
-| 8 | `MarketVoided` | `void_market` | market_index, voided_by |
-| 9 | `CreatorWithdrawal` | `withdraw_creator` | market_index, creator, bond_returned, lp_fees_returned |
+| 1 | `MarketCreated` | `create_market` | market_index, market_type, category, creator, question, deadline, bond, tiers (if tiered) |
+| 2 | `BetPlaced` | `place_bet` | market_index, bet_index, bettor, amount (side/outcome/estimate **NOT** emitted — encrypted) |
+| 3 | `MarketLocked` | `lock_market` | market_index, locked_at |
+| 4 | `MarketSettled` | `settle_market` | market_index, market_type, winning_side/outcome/median (pools revealed post-decryption) |
+| 5 | `PayoutClaimed` | `claim` | market_index, bet_index, bettor, payout_amount |
+| 6 | `CreatorWithdrawal` | `withdraw_creator` | market_index, creator, bond_returned, lp_fees_returned |
+| 7 | `MarketVoided` | `void_market` | market_index, voided_by |
 
 ---
 
@@ -397,7 +581,7 @@ SETTLEMENT (decrypt + compute)
 
   Oracle                          Arcium MPC Network                 Solana Program
     │                                    │                                │
-    │  1. settle(winning_side)           │                                │
+    │  1. settle_market(outcome)         │                                │
     │───────────────────────────────────────────────────────────────────►│
     │                                    │                                │
     │                                    │  2. Program triggers MPC       │
@@ -413,8 +597,7 @@ SETTLEMENT (decrypt + compute)
     │                                    │───────────────────────────────►│
     │                                    │                                │
     │                                    │    5. Program writes:          │
-    │                                    │       yes_pool, no_pool,       │
-    │                                    │       winning_side,            │
+    │                                    │       pools, winner info,      │
     │                                    │       status = Settled         │
     │                                    │                                │
     │                                    │    6. Emit MarketSettled        │
@@ -425,173 +608,165 @@ SETTLEMENT (decrypt + compute)
 
 | Data | During Open/Locked | After Settlement |
 |------|-------------------|-----------------|
-| Market question | Public | Public |
-| Market category | Public | Public |
-| Market deadline | Public | Public |
+| Market question, category, deadline | Public | Public |
 | Total bet count | Public | Public |
 | Total tokens in vault | Public (SPL balance) | Public |
 | Individual bet side/outcome/estimate | **ENCRYPTED** | Decrypted |
-| Pool breakdowns (yes/no/per-outcome) | **HIDDEN** (not computed yet) | Public |
+| Pool breakdowns (yes/no/per-outcome) | **HIDDEN** | Public |
 | Who bet on what | **ENCRYPTED** | Public |
 | Winner/loser status | N/A | Public |
 | Payout amounts | N/A | Public |
 
-### Arcium Accounts (additional PDAs)
-
-The Arcium integration adds these to instruction account lists:
+### Arcium Accounts (passed in when needed)
 
 ```
 arcium_config: Pubkey          // Arcium program config
-mxe_account: Pubkey            // MXE (Multi-party eXecution Environment) account
-encrypted_bet_account: Pubkey  // stores ciphertext per bet
-computation_account: Pubkey    // tracks MPC computation state during settlement
+mxe_account: Pubkey            // MXE (Multi-party eXecution Environment)
+encrypted_bet_account: Pubkey  // ciphertext per bet
+computation_account: Pubkey    // MPC computation state during settlement
 ```
 
-These are owned by the Arcium program — Cypher's program does a CPI (cross-program invocation) to Arcium for encrypt/decrypt operations.
+Owned by Arcium program. Cypher does CPI to Arcium for encrypt/decrypt.
 
 ---
 
 ## Full Flows — End to End
 
-### Flow 1: YesNo Market (e.g. "Will BTC hit $200k by Dec 2026?")
+### Flow 1: YesNo Market
 
 ```
-Step  Instruction              Who            What Happens
-────  ───────────────────────  ─────────────  ──────────────────────────────────────
- 1    initialize_protocol      Admin          Protocol PDA created (once ever)
- 2    create_market             Creator        Market + Vault PDAs created, bond deposited
- 3    place_bet_yesno          Alice          Bets Yes $50 → encrypted, tokens in Vault
- 4    place_bet_yesno          Bob            Bets No $30 → encrypted, tokens in Vault
- 5    place_bet_yesno          Carol          Bets Yes $20 → encrypted, tokens in Vault
-      ...more bets...
- 6    lock_market              Crank/Creator  After deadline, status → Locked
- 7    settle_yesno             Oracle         Arcium MPC decrypts all bets, computes pools,
-                                              posts yes_pool + no_pool on-chain,
-                                              sets winning_side, status → Settled
- 8    claim                    Alice          Computes share, transfers payout from Vault
- 9    claim                    Carol          Same
-10    withdraw_creator         Creator        Gets bond + LP fees from Vault
+"Will BTC hit $200k by Dec 2026?"
+
+Step  Instruction        Who            What Happens
+────  ─────────────────  ─────────────  ─────────────────────────────────────────
+ 1    initialize_protocol Admin         Protocol PDA created (once ever)
+ 2    create_market       Creator        Market(YesNo) + Vault, bond deposited
+ 3    place_bet           Alice          YesNo { side: Yes, amount: 50 } → encrypted
+ 4    place_bet           Bob            YesNo { side: No, amount: 30 } → encrypted
+ 5    place_bet           Carol          YesNo { side: Yes, amount: 20 } → encrypted
+ 6    lock_market         Crank          After deadline → status = Locked
+ 7    settle_market       Oracle         YesNo { winning_side: Yes }
+                                         → Arcium decrypts → pools revealed → Settled
+ 8    claim               Alice          Winner payout from Vault
+ 9    claim               Carol          Winner payout from Vault
+10    withdraw_creator    Creator        bond + LP fees from Vault
 ```
 
-### Flow 2: MultiOutcome Market (e.g. "Which chain will have highest TVL?")
+### Flow 2: MultiOutcome Market
 
 ```
-Step  Instruction              Who            What Happens
-────  ───────────────────────  ─────────────  ──────────────────────────────────────
- 1    create_market             Creator        Market(Multi) + Vault, outcomes = [ETH, SOL, ARB, BASE]
- 2    place_bet_multi          Alice          Bets on ETH $50 → encrypted
- 3    place_bet_multi          Bob            Bets on SOL $30 → encrypted
- 4    place_bet_multi          Dan            Bets on ARB $40 → encrypted
-      ...
- 5    lock_market              Crank          Status → Locked
- 6    settle_multi             Oracle         Arcium decrypts, computes pools[0..3],
-                                              sets winning_outcome, status → Settled
- 7    claim                    Bob            Winner collects proportional share of losing pools
- 8    withdraw_creator         Creator        Bond + LP fees
+"Which chain will have highest TVL?"  outcomes = [ETH, SOL, ARB, BASE]
+
+Step  Instruction        Who            What Happens
+────  ─────────────────  ─────────────  ─────────────────────────────────────────
+ 1    create_market       Creator        Market(Multi, outcomes=[ETH,SOL,ARB,BASE]) + Vault
+ 2    place_bet           Alice          MultiOutcome { outcome_id: 0, amount: 50 } → encrypted
+ 3    place_bet           Bob            MultiOutcome { outcome_id: 1, amount: 30 } → encrypted
+ 4    place_bet           Dan            MultiOutcome { outcome_id: 2, amount: 40 } → encrypted
+ 5    lock_market         Crank          status = Locked
+ 6    settle_market       Oracle         MultiOutcome { winning_outcome_id: 1 }
+                                         → Arcium decrypts → pools[0..3] revealed → Settled
+ 7    claim               Bob            Winner collects share of all losing pools
+ 8    withdraw_creator    Creator        bond + LP fees
 ```
 
-### Flow 3: Accuracy Market (e.g. "What will BTC be at midnight?")
+### Flow 3: Accuracy Market (standalone)
 
 ```
-Step  Instruction              Who            What Happens
-────  ───────────────────────  ─────────────  ──────────────────────────────────────
- 1    create_market             Creator        Market(Accuracy, entry_fee=$10) + Vault
- 2    place_bet_accuracy       P1             Estimate 99,950 → encrypted, $10 → Vault
- 3    place_bet_accuracy       P2             Estimate 99,800 → encrypted, $10 → Vault
- 4    place_bet_accuracy       P3             Estimate 99,500 → encrypted, $10 → Vault
-      ...6 players total...
- 5    lock_market              Crank          Status → Locked
- 6    settle_accuracy_step     Crank          Step A: set outcome_value = 100,000
- 7    settle_accuracy_step     Crank          Step B: Arcium decrypts estimates,
-                                              computes errors, finds median (cranked, N per tx)
- 8    settle_accuracy_step     Crank          Step C: compute weights for winners (cranked)
- 9    settle_accuracy_step     Crank          Step D: finalize pools, status → Settled
-10    claim                    P1 (winner)    Weighted payout from prize_pool
-11    claim                    P2 (winner)    Weighted payout from prize_pool
-12    withdraw_creator         Creator        Bond returned (no LP fees in accuracy)
+"What will BTC be at midnight?"  entry_fee = $10
+
+Step  Instruction        Who            What Happens
+────  ─────────────────  ─────────────  ─────────────────────────────────────────
+ 1    create_market       Creator        Market(Accuracy, entry_fee=$10) + Vault
+ 2    place_bet           P1             Accuracy { estimate: 99950 } → encrypted, $10 → Vault
+ 3    place_bet           P2             Accuracy { estimate: 99800 } → encrypted, $10 → Vault
+      ...6 players...
+ 4    lock_market         Crank          status = Locked
+ 5    settle_market       Crank          Accuracy { step: SetOutcome { value: 100000 } }
+ 6    settle_market       Crank          Accuracy { step: ComputeErrors } → decrypt, calc errors
+ 7    settle_market       Crank          Accuracy { step: ComputeErrors } → more bets (cranked)
+ 8    settle_market       Crank          Accuracy { step: ComputeWeights } → weights, winners
+ 9    settle_market       Crank          Accuracy { step: Finalize } → prize_pool set, Settled
+10    claim               P1             Weighted payout
+11    claim               P2             Weighted payout
+12    withdraw_creator    Creator        bond returned
 ```
 
-### Flow 4: Tiered Accuracy Lobby (e.g. "BTC price at midnight" — 4 tiers)
+### Flow 4: Tiered Accuracy Lobby
 
 ```
-Step  Instruction              Who            What Happens
-────  ───────────────────────  ─────────────  ──────────────────────────────────────
- 1    create_tiered_market     Creator        MarketGroup + 4 Markets + 4 Vaults
-                                              Bronze($1), Silver($10), Gold($100), Diamond($1k)
- 2    place_bet_accuracy       Player A       Joins Bronze → encrypted estimate, $1 → Vault
- 3    place_bet_accuracy       Player B       Joins Gold → encrypted estimate, $100 → Vault
-      ...players join different tiers...
- 4    lock_market ×4           Crank          Lock all 4 tier Markets
- 5    settle_group             Oracle         Set outcome_value on MarketGroup (shared)
- 6    settle_accuracy_step ×N  Crank          Crank each tier independently:
-                                              decrypt estimates, compute errors/weights/pools
-                                              Each tier has its own median, winners, payouts
- 7    claim                    Winners        Each tier's winners claim from their tier's Vault
- 8    withdraw_creator         Creator        Bond returned from each tier
+"BTC price at midnight" — 4 tiers: Bronze($1), Silver($10), Gold($100), Diamond($1k)
+
+Step  Instruction        Who            What Happens
+────  ─────────────────  ─────────────  ─────────────────────────────────────────
+ 1    create_market       Creator        Accuracy + tiers → MarketGroup + 4 Markets + 4 Vaults
+ 2    place_bet           PlayerA        Joins Bronze (Market #5) → encrypted, $1 → Vault
+ 3    place_bet           PlayerB        Joins Gold (Market #7) → encrypted, $100 → Vault
+      ...players join whichever tier...
+ 4    lock_market ×4      Crank          Lock each tier's Market
+ 5    settle_market       Oracle         Sets outcome_value on MarketGroup (shared)
+ 6    settle_market ×N    Crank          Crank each tier through SetOutcome → ComputeErrors →
+                                         ComputeWeights → Finalize
+                                         Each tier has own median, own winners, own payouts
+ 7    claim               Winners        Each winner claims from their tier's Vault
+ 8    withdraw_creator    Creator        bond returned from each tier
 ```
 
 ### Flow 5: Void Market (emergency)
 
 ```
-Step  Instruction              Who            What Happens
-────  ───────────────────────  ─────────────  ──────────────────────────────────────
- 1    void_market              Authority      Market.status → Voided
- 2    claim (refund mode)      Each bettor    Full deposit returned from Vault
- 3    withdraw_creator         Creator        Bond returned
+Step  Instruction        Who            What Happens
+────  ─────────────────  ─────────────  ─────────────────────────────────────────
+ 1    void_market         Authority      status = Voided
+ 2    claim               Each bettor    Full deposit refunded from Vault
+ 3    withdraw_creator    Creator        bond returned
 ```
 
 ---
 
 ## Instruction → Account Matrix
 
-Which accounts each instruction reads/writes:
-
 | Instruction | Protocol | Market | Vault | Bet | MarketGroup | Arcium |
 |------------|----------|--------|-------|-----|-------------|--------|
 | `initialize_protocol` | **init** | | | | | |
-| `create_market` | **mut** | **init** | **init** | | | |
-| `create_tiered_market` | **mut** | **init ×4** | **init ×4** | | **init** | |
-| `place_bet_yesno` | | **mut** | **mut** | **init** | | **CPI** |
-| `place_bet_multi` | | **mut** | **mut** | **init** | | **CPI** |
-| `place_bet_accuracy` | | **mut** | **mut** | **init** | | **CPI** |
+| `create_market` | **mut** | **init** (×N if tiered) | **init** (×N) | | **init** (if tiered) | |
+| `place_bet` | | **mut** | **mut** | **init** | | **CPI** |
 | `lock_market` | | **mut** | | | | |
-| `settle_yesno` | | **mut** | | read | | **CPI** |
-| `settle_multi` | | **mut** | | read | | **CPI** |
-| `settle_accuracy_step` | | **mut** | | **mut** | | **CPI** |
-| `settle_group` | | | | | **mut** | |
+| `settle_market` | | **mut** | | **mut** (accuracy) | **mut** (if tiered) | **CPI** |
 | `claim` | | read | **mut** | **mut** | | |
 | `withdraw_creator` | | read | **mut** | | | |
 | `void_market` | read | **mut** | | | | |
 
 ---
 
-## Error Codes
+## Error Codes — 15
 
 | Code | Name | When |
 |------|------|------|
-| 6000 | `MarketNotOpen` | Bet placed on locked/settled/voided market |
+| 6000 | `MarketNotOpen` | Bet placed on non-open market |
 | 6001 | `MarketNotLocked` | Settlement called before lock |
 | 6002 | `MarketNotSettled` | Claim called before settlement |
 | 6003 | `AlreadyClaimed` | Bet.claimed == true |
 | 6004 | `InvalidOutcome` | outcome_id >= outcome_count |
 | 6005 | `DeadlineNotReached` | Lock called before resolution_deadline |
-| 6006 | `Unauthorized` | Caller is not authority/creator where required |
+| 6006 | `Unauthorized` | Caller not authority/creator |
 | 6007 | `InvalidTierCount` | Tiers < 1 or > 4 |
-| 6008 | `OutcomeTooMany` | More than 10 outcomes for MultiOutcome |
-| 6009 | `OutcomeTooFew` | Fewer than 2 outcomes for MultiOutcome |
+| 6008 | `OutcomeTooMany` | > 10 outcomes for MultiOutcome |
+| 6009 | `OutcomeTooFew` | < 2 outcomes for MultiOutcome |
 | 6010 | `ZeroAmount` | Bet amount is 0 |
 | 6011 | `NotAWinner` | Loser tries to claim |
-| 6012 | `GroupNotSettled` | Tier settlement before group outcome is set |
+| 6012 | `GroupNotSettled` | Tier settle before group outcome set |
 | 6013 | `DecryptionFailed` | Arcium MPC returned invalid result |
-| 6014 | `QuestionTooLong` | Question exceeds 200 bytes |
+| 6014 | `QuestionTooLong` | Question > 200 bytes |
+| 6015 | `BetTypeMismatch` | PlaceBetParams variant doesn't match market type |
 
 ---
 
-## File Structure (target)
+## File Structure
 
 ```
 programs/cypher/src/
-├── lib.rs                         // program entrypoint, instruction dispatch
+├── lib.rs                         // entrypoint, 8 instructions dispatched here
 ├── state/
 │   ├── mod.rs
 │   ├── protocol.rs                // Protocol account
@@ -602,21 +777,15 @@ programs/cypher/src/
 ├── instructions/
 │   ├── mod.rs
 │   ├── initialize_protocol.rs
-│   ├── create_market.rs
-│   ├── create_tiered_market.rs
-│   ├── place_bet_yesno.rs
-│   ├── place_bet_multi.rs
-│   ├── place_bet_accuracy.rs
+│   ├── create_market.rs           // handles YesNo, Multi, Accuracy, Tiered — branches inside
+│   ├── place_bet.rs               // handles all bet types — reads market_type, branches
 │   ├── lock_market.rs
-│   ├── settle_yesno.rs
-│   ├── settle_multi.rs
-│   ├── settle_accuracy_step.rs
-│   ├── settle_group.rs
-│   ├── claim.rs
+│   ├── settle_market.rs           // handles all settlement — YesNo/Multi (1 tx), Accuracy (cranked)
+│   ├── claim.rs                   // handles payout + refund (voided)
 │   ├── withdraw_creator.rs
 │   └── void_market.rs
-├── errors.rs                      // CypherError enum
-├── events.rs                      // all 9 events
+├── errors.rs                      // CypherError enum (16 codes)
+├── events.rs                      // 7 events
 └── arcium/
     ├── mod.rs
     ├── encrypt.rs                 // CPI to Arcium for bet encryption
@@ -626,16 +795,16 @@ programs/cypher/src/
 
 ---
 
-## Summary Counts
+## Summary
 
 | What | Count |
 |------|-------|
-| Account types | 5 (Protocol, Market, Vault, Bet, MarketGroup) |
-| Instructions | 14 |
-| Events | 9 |
-| Error codes | 15 |
+| Account types | 5 |
+| Instructions | 8 |
+| Events | 7 |
+| Error codes | 16 |
 | Market types | 3 (YesNo, MultiOutcome, Accuracy) |
 | Categories | 7 |
 | Max outcomes (Multi) | 10 |
 | Max tiers (Accuracy) | 4 |
-| Settlement steps (Accuracy) | 4 (SetOutcome, ComputeErrors, ComputeWeights, Finalize) |
+| Accuracy settlement steps | 4 (SetOutcome, ComputeErrors, ComputeWeights, Finalize) |
