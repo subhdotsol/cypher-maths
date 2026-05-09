@@ -1,0 +1,407 @@
+LEVERAGE & ORDER TYPES IN PREDICTION MARKETS — CYPHER RESEARCH
+================================================================
+
+
+PART 1: LEVERAGE
+=================
+
+
+HOW INTO/SPACE DOES LEVERAGE
+-----------------------------
+
+They use a CLOB (Central Limit Order Book) + Share Tokens model.
+Completely different architecture from Cypher's parimutuel pools.
+
+Their model:
+  1. Shares are actual SPL tokens — YES token, NO token
+  2. Deposit $1 USDC → mint 1 YES share + 1 NO share
+  3. Shares trade on an order book at variable prices ($0.15, $0.65, etc.)
+  4. If your side wins → each share pays out $1.00
+  5. If your side loses → each share pays out $0.00
+
+Because shares have a FIXED PRICE at the time you buy them, leverage works:
+
+  You want to buy at $0.15 per share.
+  Without leverage: pay $150 → get 1,000 shares
+  With 5x leverage: pay $30 margin → control 1,000 shares ($150 position)
+
+  If price goes to $0.30:
+    Position value = 1,000 × $0.30 = $300
+    Your equity = $300 - $120 debt = $180
+    Profit = $150 on $30 margin = 500% ROE
+
+  If price drops to ~$0.13:
+    Position value = 1,000 × $0.13 = $130
+    Your equity = $130 - $120 = $10  (below 10% maintenance margin)
+    → LIQUIDATED
+
+Their key parameters:
+  - Initial Margin (IM): 20% required to open position
+  - Maintenance Margin (MM): 10% to keep position open
+  - Max Leverage: 10x
+  - Liquidation formula: (Entry Price × Shares - Margin) / (Shares × (1 - MM))
+  - Staged liquidation: 25% tranches, not all at once, 10% insurance fund penalty
+
+The key: shares have a MARK-TO-MARKET PRICE at every moment.
+The system knows what your position is worth right now,
+so it can calculate when to liquidate you.
+
+
+CYPHER'S MODEL: PARIMUTUEL POOLS
+---------------------------------
+
+  1. No shares. No tokens. Just pool ratios.
+  2. You deposit money into a pool (Yes/No/outcome).
+  3. Your payout is calculated ONCE at the END based on final pool sizes.
+  4. There's no "current price" of your position during the market.
+  5. There's nothing to liquidate — your money is already in the pool.
+
+
+WHY LEVERAGE DOESN'T WORK WITH PARIMUTUEL
+-------------------------------------------
+
+Leverage needs three things parimutuel doesn't have:
+
+1. A REAL-TIME POSITION VALUE
+   Order book: your 1,000 shares at any moment = shares × current_price.
+   Parimutuel: your $10 in the Yes pool is just $10 in the pool.
+   There's no price to mark it against until settlement.
+
+2. SOMETHING TO LIQUIDATE
+   Leverage = you borrowed money. If position goes against you, protocol
+   force-closes and takes back what you borrowed. Order book sells your
+   shares on the market. Parimutuel has no one to sell to — money is
+   locked in pool until settlement.
+
+3. CONTINUOUS EXIT CAPABILITY
+   Order book traders can sell shares at any time.
+   Parimutuel bettors can't withdraw — pool is locked.
+   If you can't exit, you can't be liquidated.
+
+
+POSSIBLE PATHS FOR CYPHER TO ADD LEVERAGE
+------------------------------------------
+
+PATH A: Build a CLOB Market Type
+  Completely different architecture. Add a new market type to Cypher
+  alongside parimutuel (YesNo/Multi) and Accuracy.
+
+  Would need:
+    - YES/NO share tokens (SPL tokens, mint/burn mechanism)
+    - Deposit $1 USDC → mint 1 YES + 1 NO token
+    - On-chain order book for trading shares
+    - Margin engine tracking positions, collateral, liquidation thresholds
+    - Liquidation bots
+    - Insurance fund for bad debt
+
+  This is not an upgrade to parimutuel — it's a separate product.
+  But Cypher's enum-based state design already supports adding new
+  market types. Would be a 4th MarketType variant.
+
+  Pros:
+    - Real leverage with real liquidation
+    - Continuous trading (exit anytime)
+    - Real price discovery
+    - What the "big" markets (Polymarket, Into/Space) do
+
+  Cons:
+    - Massively more complex (order book matching engine on-chain)
+    - Needs market makers / liquidity providers
+    - Liquidation infrastructure
+    - Basically building a mini exchange
+
+
+PATH B: Synthetic Leverage via Lending Wrapper
+  Keep parimutuel underneath, build a lending layer on top.
+
+  Flow:
+    User has $30, wants 5x leverage on Yes.
+    1. User deposits $30 as collateral into a Leverage Vault
+    2. Leverage Vault lends them $120 (from a lending pool funded by LPs)
+    3. $150 total goes into the parimutuel Yes pool as a normal bet
+    4. If Yes wins:
+         payout calculated normally from pool
+         user repays $120 + interest to vault
+         keeps the rest as profit
+    5. If No wins:
+         user's $30 collateral is forfeit to the lending pool
+         lending pool absorbs the $120 loss (or insurer does)
+
+  Problem: Who provides the $120?
+    - Lenders take on risk that the bet loses
+    - Need high interest rates or insurance
+    - No liquidation during the market — lender is locked until settlement
+    - Very different risk profile from Into/Space's real-time liquidation
+    - Lender could lose 100% of principal if the bet loses
+
+  Would need:
+    - Lending pool account (LPs deposit capital for others to borrow)
+    - Leverage Vault PDA per leveraged bet
+    - Interest rate model
+    - Post-settlement repayment logic
+    - Insurance fund for default scenarios
+
+
+PATH C: Pseudo-Leverage with Multiplied Payouts
+  Simplest approach. Not real leverage — amplified risk/reward.
+
+  Flow:
+    User bets $30 with 5x multiplier selected.
+    Protocol treats it as if user bet $150.
+    If user wins: payout calculated on $150 position, profit amplified.
+    If user loses: user only loses $30 (their actual deposit).
+
+    The difference ($120 of "phantom" pool contribution) comes from
+    a house/insurance fund that subsidizes the leverage.
+
+  Example:
+    Market: yes_pool = 500, no_pool = 500 (before this bet)
+    User bets $30 on Yes with 5x
+    Protocol adds $150 to yes_pool (user paid $30, house covers $120)
+
+    If Yes wins:
+      share = 150 / 650 = 23.08%
+      winnings = 0.2308 × 500 = $115.38
+      total_return = 150 + 115.38 = $265.38
+      house takes back $120
+      user gets $145.38
+      user profit = $145.38 - $30 = +$115.38
+
+    If No wins:
+      user loses $30
+      house loses $120 (from insurance fund)
+
+  Problem:
+    - Cypher becomes "the house" — takes directional risk
+    - Needs a large insurance/reserve fund
+    - Fund can be drained by coordinated winners
+    - Not truly decentralized
+
+
+LEVERAGE CONCLUSION
+--------------------
+
+Leverage and parimutuel are fundamentally incompatible.
+Into/Space can do leverage because they have:
+  ✓ Shares with real-time prices
+  ✓ Order book for continuous trading
+  ✓ Exit liquidity at any moment
+  ✓ Mark-to-market for liquidation calculations
+
+Cypher's parimutuel pools have none of these.
+
+Realistic options ranked by feasibility:
+  1. Path A (CLOB) — best product, hardest to build
+  2. Path B (Lending) — works but lenders bear heavy risk
+  3. Path C (Pseudo) — easiest but Cypher becomes the house
+
+If leverage is a priority, Path A as a new MarketType is the
+clean long-term answer. The state.rs enum design already supports
+adding MarketType::Leveraged with its own MarketData variant.
+
+
+================================================================
+
+
+PART 2: MARKET ORDERS VS LIMIT ORDERS
+=======================================
+
+
+HOW INTO/SPACE DOES IT
+-----------------------
+
+The foundation: shares as SPL tokens.
+
+  Deposit $1 USDC → mint 1 YES token + 1 NO token (SPL tokens on Solana)
+
+  YES token: worth $1 if outcome happens, $0 if not
+  NO token:  worth $1 if outcome doesn't happen, $0 if it does
+
+  YES price + NO price ≈ $1.00 always (enforced by arbitrage)
+  If YES=$0.65 and NO=$0.40 (total $1.05):
+    → Arbitrageur mints pair for $1, sells both for $1.05, pockets $0.05
+    → This pushes prices back to summing to $1.00
+
+These tokens live in wallets. They can be transferred, listed on
+order books, traded freely — just like any SPL token.
+
+
+LIMIT ORDER
+  You set the price. The order sits on the book waiting to be matched.
+
+  Alice: "I want to BUY 100 YES shares at $0.35"
+    → Order sits on the book. Nothing happens yet.
+    → Alice is a MAKER (adds liquidity). Pays 0% fee.
+
+  Later, Bob: "I want to SELL 80 YES shares at $0.35"
+    → Matches against Alice's order.
+    → Bob is a TAKER (removes liquidity). Pays dynamic fee.
+    → 80 shares transfer from Bob → Alice at $0.35 each.
+    → Alice's order still has 20 shares remaining on the book.
+
+
+MARKET ORDER
+  You accept whatever the best available price is. Fills instantly.
+
+  Order book state:
+    SELL side (asks):
+      100 YES @ $0.37  (oldest)
+      200 YES @ $0.38
+      50  YES @ $0.40
+
+  Carol: "I want to BUY 150 YES shares at MARKET price"
+    → Takes 100 @ $0.37 = $37.00
+    → Takes 50  @ $0.38 = $19.00
+    → Total: 150 shares for $56.00 (avg price $0.3733)
+    → Carol is a TAKER. Pays dynamic fee.
+
+  Market orders eat through the book from best price to worst.
+  That's why big market orders get worse average prices — SLIPPAGE.
+
+
+PRICE-TIME PRIORITY
+  Two orders at the same price?
+    → The one placed FIRST gets filled first.
+
+  Two orders at different prices?
+    → The one with the BETTER price gets filled first.
+      (lower ask or higher bid)
+
+
+THEIR FEE STRUCTURE
+  Makers (limit orders): 0% fee — incentivized to add liquidity
+  Takers (market orders): dynamic fee based on market probability
+
+  Buy fee formula:
+    F_buy(p)  = 0.02% + (2.00% - 0.02%) × (1 - (p/100)^1.3)
+
+  Sell fee formula (Gaussian, peaks at 50% probability):
+    F_sell(p) = 0.02% + (1.00% - 0.02%) × e^(-0.5 × ((p-50)/σ)^2)
+
+  Examples:
+    At 20% probability → buy fee ~1.76%, sell fee ~0.12%
+    At 80% probability → buy fee ~0.10%, sell fee higher
+
+  Early/contrarian bets cost more in fees.
+  Consensus bets cost less.
+
+  Full trade example:
+    Open:  1,000 YES shares at $0.30 (30% prob) via market order
+           Cost = $300 + 1.6% fee ($4.80) = $304.80
+
+    Close: sell at $0.80 (80% prob)
+           Proceeds = $800 - 0.04% fee ($0.32) = $799.68
+
+    Profit: $494.88 (162% ROI)
+
+
+WHY CYPHER CAN'T DO THIS (RIGHT NOW)
+--------------------------------------
+
+Parimutuel has no order book, no shares, no continuous trading:
+
+  CLOB (Into/Space)                   PARIMUTUEL (Cypher)
+  ──────────────────                  ─────────────────────
+  Tradeable share tokens              No tokens — just pool deposits
+  Buy/sell at any time                Deposit once, locked until settlement
+  Price set by traders                Price is just pool ratio
+  Limit orders sit on book            No book — money goes straight to pool
+  Market orders fill instantly        No orders — just place_bet()
+  Can exit before settlement          Cannot exit
+  Maker/taker distinction             Everyone is the same
+
+The core issue: in parimutuel, when you "bet $10 on Yes," that $10
+is IMMEDIATELY mixed into the pool. There's no share token you hold,
+nothing to sell back, no order book to post on.
+
+
+WHAT CYPHER WOULD NEED TO ADD CLOB
+------------------------------------
+
+1. SHARE TOKEN INFRASTRUCTURE
+
+  New instruction: mint_shares(market, amount)
+    → User deposits $1 USDC
+    → Program mints 1 YES token + 1 NO token to user's wallet
+    → Uses SPL Token program, one mint per outcome per market
+
+  New instruction: burn_shares(market)
+    → User returns 1 YES + 1 NO token
+    → Program burns both, returns $1 USDC
+    → Arbitrage mechanism that keeps prices honest
+
+2. ORDER BOOK ACCOUNTS
+
+  New account: OrderBook PDA per market
+    → bids: sorted list of buy orders (price descending)
+    → asks: sorted list of sell orders (price ascending)
+
+  New account: Order PDA per order
+    → owner, side (bid/ask), price, quantity, timestamp, filled, status
+
+3. TWO INSTRUCTION TYPES
+
+  place_limit_order(market, side, price, quantity)
+    → Posts order on book. Waits for match. Maker.
+
+  place_market_order(market, side, quantity)
+    → Matches against best available orders immediately. Taker.
+
+  cancel_order(order)
+    → Removes unfilled limit order from book. Returns tokens.
+
+4. MATCHING ENGINE
+
+  On every new order:
+    → Walk the opposite side of the book
+    → Match at best price first, then next best, etc.
+    → Partial fills allowed (100 share order can match against 60 + 40)
+    → Unmatched remainder stays on book (limit) or fails (market)
+
+
+HOW HARD IS THIS?
+------------------
+
+Building an on-chain CLOB is one of the hardest things in Solana.
+It's what Phoenix, OpenBook, and Into/Space do — each with massive
+engineering effort.
+
+The matching engine alone is complex:
+  - Sorting orders by price-time priority
+  - Partial fills (order matched across multiple counterparties)
+  - Cancellations (removing orders, freeing capital)
+  - Self-trade prevention
+  - Handling token transfers atomically with matches
+
+PRACTICAL PATH FOR CYPHER:
+  - Keep parimutuel (YesNo, Multi, Accuracy) as the core
+    → simpler, fairer, works, no liquidity bootstrapping needed
+  - If CLOB is wanted later, add as MarketType::Clob
+    → own MarketData::Clob variant in state.rs
+  - OR integrate with an existing CLOB (Phoenix / OpenBook)
+    rather than building a matching engine from scratch
+    → Cypher mints share tokens, lists them on Phoenix
+    → Phoenix handles all order matching
+    → Cypher handles settlement (burn shares, pay $1 to winners)
+
+
+================================================================
+
+
+PART 3: COMPARISON SUMMARY
+============================
+
+                        PARIMUTUEL (Cypher now)    CLOB (Into/Space)
+                        ──────────────────────     ─────────────────
+Tradeable shares?       No                         Yes (SPL tokens)
+Order book?             No                         Yes
+Limit orders?           No                         Yes
+Market orders?          No                         Yes
+Leverage?               No                         Yes (up to 10x)
+Exit before settle?     No                         Yes
+Price discovery         Pool ratio (passive)       Trader orders (active)
+Liquidity needed?       No (pools self-fill)       Yes (makers required)
+Complexity              Low                        Very high
+Fairness                High (no early advantage)  Depends on liquidity
+MEV risk                Low                        High (front-running)
+Best for                Simple prediction bets     Active trading markets
