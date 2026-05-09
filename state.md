@@ -2,7 +2,11 @@
 
 ## What Cypher Does
 
-One Solana program, three market types:
+One Solana program, three market types, seven categories:
+
+**Categories:** Crypto · Politics · Sports · Tech · Economy · Culture · Beyond
+
+Every market gets a category when created. The frontend uses it to show filtered views (e.g. "all Crypto markets", "all Politics markets"). On-chain it's a 1-byte enum on the Market account — cheap to store, easy to filter with `getProgramAccounts`.
 
 | | **YesNo** | **MultiOutcome** | **Accuracy** |
 |---|---|---|---|
@@ -39,10 +43,11 @@ One Solana program, three market types:
           │             MARKET #0                  │
           │  PDA: ["market", 0u64.to_le_bytes()]   │
           │                                        │
-          │  creator, question, type, status       │
-          │  fees, deadline, total_bets            │
+          │  creator, question, type, category     │
+          │  status, fees, deadline, total_bets    │
           │  vault ──────┐                         │
           │  market_data │ (YesNo/Multi/Accuracy)  │
+          │  market_group│ (None or → MarketGroup) │
           └──────┬───────┼────────────────────────-┘
                  │       │
                  │       ▼
@@ -67,18 +72,41 @@ One Solana program, three market types:
 │Mlt/Acc)│ │Mlt/Acc)│ │  acy)   │
 │ claimed │ │ claimed │ │ claimed │
 └─────────┘ └─────────┘ └─────────┘
+
+
+  TIERED LOBBIES (Accuracy only):
+
+  ┌─────────────────────────────────────────────────────────┐
+  │              MARKET GROUP                               │
+  │  PDA: ["market_group", group_index]                     │
+  │                                                         │
+  │  question: "What will BTC be at midnight?"              │
+  │  outcome_value: set once, shared by all tiers           │
+  │  tiers:                                                 │
+  │    Bronze  ($1)   → Market #5  → Vault, Bets            │
+  │    Silver  ($10)  → Market #6  → Vault, Bets            │
+  │    Gold    ($100) → Market #7  → Vault, Bets            │
+  │    Diamond ($1k)  → Market #8  → Vault, Bets            │
+  └─────────────────────────────────────────────────────────┘
+
+  Each tier is a full independent Market account with its own
+  Vault and Bets. The MarketGroup links them so they share the
+  same question and settle from the same oracle outcome.
 ```
 
-**4 account types. That's it.**
+**5 account types.**
 
 | Account | Count | PDA Seeds | Approx Size | Rent |
 |---------|-------|-----------|-------------|------|
 | Protocol | 1 total | `["protocol"]` | 83 bytes | ~0.001 SOL |
-| Market | 1 per market | `["market", index]` | 394–823 bytes | ~0.003–0.007 SOL |
+| MarketGroup | 1 per tiered lobby | `["market_group", group_index]` | ~561 bytes | ~0.004 SOL |
+| Market | 1 per market (or per tier) | `["market", index]` | 395–824 bytes | ~0.003–0.007 SOL |
 | Vault | 1 per market | `["vault", market_key]` | 165 bytes (SPL) | ~0.002 SOL |
 | Bet | 1 per bet | `["bet", market_key, bet_index]` | 124–146 bytes | ~0.001 SOL |
 
-Market size varies by type: YesNo (~394), MultiOutcome (~823, largest due to fixed 10-slot arrays), Accuracy (~438).
+Market size varies by type: YesNo (~395), MultiOutcome (~824, largest due to fixed 10-slot arrays), Accuracy (~439). The `category` field adds 1 byte (enum tag).
+
+MarketGroup is only created for tiered accuracy lobbies. Standalone markets don't need one.
 
 ---
 
@@ -116,13 +144,13 @@ Creates:
 ### 2. Create Market
 
 ```
-Creator calls: create_market(question, market_type, bond, lp_fee_bps, deadline, outcomes?)
+Creator calls: create_market(question, market_type, category, bond, lp_fee_bps, deadline, outcomes?)
 
 Reads:  Protocol.market_count → index
 Writes: Protocol.market_count += 1
 
 Creates:
-  Market PDA ← all fields, status=Open, market_data based on type
+  Market PDA ← all fields, category=chosen, status=Open, market_data based on type
   Vault PDA  ← SPL token account, authority = program PDA
 
   For MultiOutcome:
@@ -132,6 +160,36 @@ Creates:
 Transfers:
   creator_bond tokens → Vault
 ```
+
+### 2b. Create Tiered Lobby (Accuracy only)
+
+```
+Creator calls: create_tiered_market(question, bond, deadline, tiers)
+
+  tiers = [
+    ("Bronze",  entry_fee: 1_000_000),     // $1
+    ("Silver",  entry_fee: 10_000_000),    // $10
+    ("Gold",    entry_fee: 100_000_000),   // $100
+    ("Diamond", entry_fee: 1_000_000_000), // $1000
+  ]
+
+Creates:
+  MarketGroup PDA ← question, deadline, tier_count=4, labels, fees
+  Market #5 PDA   ← Accuracy { entry_fee: 1M },    market_group = Some(group)
+  Market #6 PDA   ← Accuracy { entry_fee: 10M },   market_group = Some(group)
+  Market #7 PDA   ← Accuracy { entry_fee: 100M },  market_group = Some(group)
+  Market #8 PDA   ← Accuracy { entry_fee: 1000M }, market_group = Some(group)
+  Vault PDA × 4   ← one per tier market
+
+MarketGroup.tier_markets = [#5, #6, #7, #8]
+
+Transfers:
+  creator_bond tokens → each tier's Vault (or single bond in group)
+```
+
+Players join whichever tier they want. Each tier has its own pool,
+its own median, its own winners. The formula is identical — only
+the entry_fee differs. ROI is the same across tiers for equal skill.
 
 ### 3. Place Bet
 
@@ -236,6 +294,22 @@ Updates Market:
 Edge case — if pools[winning_outcome_id] == 0 (nobody bet on winner):
   → Market is voided, all bettors get refunds
   → OR protocol takes the unclaimed pool (design choice)
+```
+
+#### Accuracy (Tiered) — settle group, then crank each tier
+
+```
+Oracle/Creator calls: settle_group(group, outcome_value)
+
+Updates MarketGroup:
+  outcome_value = Some(value)
+
+Then for EACH tier market in the group, run the same accuracy
+settlement steps (A–D) below. Each tier has different players,
+different median, different winners — but the same outcome_value.
+
+The MarketGroup ensures all tiers use the same oracle value.
+No tier can be settled with a different outcome.
 ```
 
 #### Accuracy — multi-step (crank)
@@ -382,6 +456,55 @@ On Solana, account size must be known at creation. Options were:
 - The label is stored once in the Market account; bets just reference by index
 - Frontend resolves outcome_id → label by reading the Market account
 
+### Why a MarketGroup instead of just separate markets?
+
+Without MarketGroup, tiered lobbies are just separate markets that happen to ask the same question. That works, but has problems:
+- Nothing enforces that all tiers settle with the same outcome value
+- A malicious creator could settle Bronze with one outcome and Gold with another
+- The frontend has to guess which markets belong together
+
+MarketGroup solves all three:
+- Outcome is set ONCE on the group, shared by all tiers
+- Settlement instruction reads outcome from the group — can't diverge
+- On-chain linkage: `market.market_group → MarketGroup.tier_markets[]`
+- Frontend can fetch one MarketGroup and know all tier markets instantly
+
+### Why MAX_TIERS = 4 instead of more?
+
+Four tiers (Bronze/Silver/Gold/Diamond) cover the practical range from $1 to $1000. More tiers means:
+- Thinner player pools per tier (bad for prize pools)
+- Larger MarketGroup account (more rent)
+- Diminishing returns — $1/$10/$100/$1000 already spans 3 orders of magnitude
+
+If someone needs finer granularity, they create two separate tiered lobbies.
+
+### Why each tier is a full Market account (not fields inside MarketGroup)?
+
+Each tier has its own:
+- Player pool, median error, winner/loser counts, weights
+- Vault (separate token account per tier)
+- Bet accounts (separate PDAs per tier)
+
+These are all per-tier state. Putting them inside MarketGroup would mean one massive account. Keeping them as separate Markets means:
+- Each tier settles independently (different crank runs)
+- Existing Accuracy settlement logic works unchanged
+- MarketGroup only adds the shared question + outcome linkage
+
+### Why a MarketCategory enum on-chain instead of off-chain tagging?
+
+Storing the category on-chain (1 byte) means the frontend can use `getProgramAccounts` with a `memcmp` filter to fetch only markets of a specific category in a single RPC call — no client-side filtering needed. This is how the UI shows "all Crypto markets" or "all Politics markets" efficiently.
+
+Seven categories cover the practical space:
+- **Crypto** — token prices, chain events, DeFi metrics
+- **Politics** — elections, legislation, geopolitics
+- **Sports** — match outcomes, player stats
+- **Tech** — product launches, company events
+- **Economy** — macro data (GDP, inflation, rates)
+- **Culture** — entertainment, social trends
+- **Beyond** — catch-all for anything else
+
+Adding new categories later = add a new enum variant. Old markets keep their category. No migration needed.
+
 ### Why basis points (bps) instead of percentages?
 
 - Integer math only — no floats on Solana
@@ -423,8 +546,8 @@ let payout: u64 = (share_numerator / winning_pool as u128) as u64;
 ```
 src/
 ├── state.rs       ← account structs, enums, sizes (YOU ARE HERE)
-├── flew.rs        ← YesNo + MultiOutcome math simulation (existing)
-├── trepa.rs       ← Accuracy math simulation (existing)
+├── flew.rs        ← YesNo + MultiOutcome + Tiered Accuracy examples
+├── trepa.rs       ← Accuracy math + Tiered Lobbies (run_round, run_tiered)
 ├── main.rs        ← test harness
 └── (future files as you build instructions)
     ├── instructions/
@@ -437,6 +560,8 @@ src/
     │   ├── settle_yesno.rs
     │   ├── settle_multi.rs
     │   ├── settle_accuracy.rs
+    │   ├── create_tiered_market.rs
+    │   ├── settle_group.rs
     │   ├── claim.rs
     │   └── void.rs
     ├── errors.rs
@@ -481,4 +606,5 @@ src/
 - **Accuracy settlement**: O(N) — must process every bet to find median and compute weights. For markets with >50 players, use a **crank** pattern: off-chain bot calls `compute_errors` repeatedly, processing ~10 bets per transaction, until all are done.
 - **Max outcomes per multi-market**: 10 (fixed). Keeps account size bounded at ~823 bytes.
 - **Max bets per market**: No hard limit since bets are separate accounts. Practical limit depends on how the frontend fetches them (getProgramAccounts with filters).
+- **Tiered lobbies**: Each tier settles independently. 4-tier lobby = 4 separate crank runs. The MarketGroup settlement is O(1) — just sets the outcome value. Total cost = O(1) group + O(N₁) + O(N₂) + O(N₃) + O(N₄) per tier.
 - **Concurrent markets**: Unlimited. Each market is independent.

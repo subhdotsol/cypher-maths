@@ -6,11 +6,18 @@
 //    2. MultiOutcome — N outcomes (up to 10), variable bet sizes, parimutuel
 //    3. Accuracy     — numeric estimate, fixed entry fee, median-error split
 //
+//  Accuracy markets support Tiered Lobbies via MarketGroup:
+//    Same question, same outcome, different entry fees (Bronze/Silver/Gold/Diamond).
+//    Each tier is its own Market account. A MarketGroup links them so they
+//    settle from the same oracle value in one step.
+//
 //  Account hierarchy:
 //    Protocol (singleton)
-//      └── Market (PDA per market)
-//            ├── Vault (SPL token account, PDA)
-//            └── Bet[] (PDA per individual bet)
+//      ├── Market (PDA per market)
+//      │     ├── Vault (SPL token account, PDA)
+//      │     └── Bet[] (PDA per individual bet)
+//      └── MarketGroup (PDA, optional — links tiered accuracy markets)
+//            └── Market[] (one per tier, each with its own Vault + Bets)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // In a real Solana program, these would be:
@@ -30,6 +37,13 @@ pub const MAX_OUTCOMES: usize = 10;
 /// Max bytes per outcome label (e.g. "Ethereum", "Solana")
 pub const MAX_OUTCOME_LABEL_LEN: usize = 32;
 
+/// Maximum number of tiers in a tiered accuracy lobby.
+/// Fixed at 4 so MarketGroup stays a known size (Bronze/Silver/Gold/Diamond).
+pub const MAX_TIERS: usize = 4;
+
+/// Max bytes per tier label (e.g. "Bronze", "Diamond")
+pub const MAX_TIER_LABEL_LEN: usize = 16;
+
 // ─────────────────────────────────────────────────────────────────────────
 //  ENUMS
 // ─────────────────────────────────────────────────────────────────────────
@@ -39,6 +53,18 @@ pub enum MarketType {
     YesNo,
     MultiOutcome,
     Accuracy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarketCategory {
+    Crypto,
+    Politics,
+    Sports,
+    Tech,
+    Economy,
+    Culture,
+    /// Catch-all for anything that doesn't fit the other categories
+    Beyond,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +128,8 @@ pub struct Market {
     pub market_index: u64,
     /// Which kind of market this is
     pub market_type: MarketType,
+    /// Market category — used by the frontend to group/filter markets
+    pub category: MarketCategory,
     /// Current lifecycle phase
     pub status: MarketStatus,
     /// Human-readable question (max 200 bytes on-chain)
@@ -123,8 +151,61 @@ pub struct Market {
     pub vault: Pubkey,
     /// Token mint for this market (e.g. USDC mint)
     pub token_mint: Pubkey,
+    /// If this market is part of a tiered lobby, points to the MarketGroup.
+    /// None for standalone markets. Set on creation, immutable.
+    pub market_group: Option<Pubkey>,
     /// Type-specific pool data
     pub market_data: MarketData,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  MARKET GROUP — links tiered accuracy markets
+//
+//  PDA seeds: ["market_group", group_index.to_le_bytes()]
+//  Owner: program
+//
+//  One MarketGroup per tiered lobby. Holds the shared question, outcome,
+//  and pointers to each tier's Market account. Settlement sets the outcome
+//  on the group, then each tier Market settles independently using its
+//  own entry_fee and player pool.
+//
+//  Example: "What will BTC be at midnight?" with 4 tiers
+//    MarketGroup → [Market(Bronze,$1), Market(Silver,$10),
+//                   Market(Gold,$100), Market(Diamond,$1000)]
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct MarketGroup {
+    /// PDA bump seed
+    pub bump: u8,
+    /// Who created this tiered lobby
+    pub creator: Pubkey,
+    /// Unique sequential index (could share Protocol.market_count or its own counter)
+    pub group_index: u64,
+    /// The shared question across all tiers (max 200 bytes)
+    pub question: String,
+    /// Shared resolution deadline — all tiers lock and settle together
+    pub resolution_deadline: i64,
+    /// When the group was created
+    pub created_at: i64,
+    /// How many tiers are active (1..=MAX_TIERS)
+    pub tier_count: u8,
+    /// Tier labels — fixed array, first `tier_count` are valid
+    /// On-chain: [[u8; MAX_TIER_LABEL_LEN]; MAX_TIERS]
+    pub tier_labels: Vec<String>,
+    /// Entry fee per tier in token base units
+    /// On-chain: [u64; MAX_TIERS]
+    pub tier_entry_fees: Vec<u64>,
+    /// Pubkey of each tier's Market account
+    /// On-chain: [Pubkey; MAX_TIERS]
+    pub tier_markets: Vec<Pubkey>,
+    /// The real-world outcome value — set once, shared by all tiers
+    /// Settlement flow: set this → each tier Market settles using this value
+    pub outcome_value: Option<u64>,
+    /// Decimal scaling for the outcome
+    pub outcome_decimals: u8,
+    /// Whether all tiers have been settled
+    pub settled: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -308,10 +389,11 @@ pub enum BetData {
 //  PDA SEEDS REFERENCE
 // ─────────────────────────────────────────────────────────────────────────
 //
-//  Protocol:  ["protocol"]
-//  Market:    ["market", market_index.to_le_bytes()]
-//  Vault:     ["vault", market.key()]
-//  Bet:       ["bet", market.key(), bet_index.to_le_bytes()]
+//  Protocol:     ["protocol"]
+//  Market:       ["market", market_index.to_le_bytes()]
+//  MarketGroup:  ["market_group", group_index.to_le_bytes()]
+//  Vault:        ["vault", market.key()]
+//  Bet:          ["bet", market.key(), bet_index.to_le_bytes()]
 //
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -325,13 +407,29 @@ pub const MAX_QUESTION_LEN: usize = 200;
 /// Protocol account size (with 8-byte Anchor discriminator)
 pub const PROTOCOL_SIZE: usize = 8 + 1 + 32 + 32 + 2 + 8; // = 83
 
+/// MarketGroup account size
+/// 8 (disc) + 1 (bump) + 32 (creator) + 8 (group_index)
+/// + 4+200 (question) + 8 (deadline) + 8 (created_at)
+/// + 1 (tier_count)
+/// + labels: 4 × (4 + 16) = 80
+/// + entry_fees: 4 × 8 = 32
+/// + tier_markets: 4 × 32 = 128
+/// + Option<u64> outcome(9) + 1 (decimals) + 1 (settled)
+pub const MARKET_GROUP_SIZE: usize = 8 + 1 + 32 + 8 + (4 + MAX_QUESTION_LEN) + 8 + 8
+    + 1
+    + (4 + MAX_TIERS * (4 + MAX_TIER_LABEL_LEN))
+    + (4 + MAX_TIERS * 8)
+    + (4 + MAX_TIERS * 32)
+    + 9 + 1 + 1;
+// = ~561 bytes
+
 /// Shared Market header size (common fields before market_data)
-/// 8 (disc) + 1 (bump) + 32 (creator) + 8 (index) + 1 (type) + 1 (status)
-/// + 4+200 (string) + 8 (bond) + 2+2 (fees) + 8+8 (timestamps)
-/// + 8 (total_bets) + 32 (vault) + 32 (mint)
-const MARKET_HEADER_SIZE: usize = 8 + 1 + 32 + 8 + 1 + 1 + (4 + MAX_QUESTION_LEN)
-    + 8 + 2 + 2 + 8 + 8 + 8 + 32 + 32;
-// = 359 bytes
+/// 8 (disc) + 1 (bump) + 32 (creator) + 8 (index) + 1 (type) + 1 (category)
+/// + 1 (status) + 4+200 (string) + 8 (bond) + 2+2 (fees) + 8+8 (timestamps)
+/// + 8 (total_bets) + 32 (vault) + 32 (mint) + Option<Pubkey> market_group(1+32)
+const MARKET_HEADER_SIZE: usize = 8 + 1 + 32 + 8 + 1 + 1 + 1 + (4 + MAX_QUESTION_LEN)
+    + 8 + 2 + 2 + 8 + 8 + 8 + 32 + 32 + 1 + 32;
+// = 393 bytes
 
 /// Market account size (YesNo variant)
 /// Header + enum tag(1) + yes_pool(8) + no_pool(8) + lp_fee_pool(8)
