@@ -2,14 +2,16 @@
 
 ## What Cypher Does
 
-One Solana program, two market types:
+One Solana program, three market types:
 
-| | **YesNo** (from `flew.rs`) | **Accuracy** (from `trepa.rs`) |
-|---|---|---|
-| **User action** | Pick Yes or No, bet any amount | Submit a numeric estimate, pay fixed entry fee |
-| **Fee split** | 1.5% LP + 0.5% protocol deducted from each bet | Protocol % taken from loser pool after settlement |
-| **Winner rule** | The side that matches the real outcome | Players whose error < median error |
-| **Payout math** | share = net_bet / winning_pool × losing_pool | weight = (1/(1+r))^6, share = weight/total_weight × prize_pool |
+| | **YesNo** | **MultiOutcome** | **Accuracy** |
+|---|---|---|---|
+| **Source** | `flew.rs` (Market) | `flew.rs` (MultiMarket) | `trepa.rs` |
+| **User action** | Pick Yes or No, bet any amount | Pick one of N outcomes (up to 10), bet any amount | Submit a numeric estimate, pay fixed entry fee |
+| **Fee split** | 1.5% LP + 0.5% protocol deducted from each bet | Same as YesNo — 1.5% LP + 0.5% protocol per bet | Protocol % taken from loser pool after settlement |
+| **Winner rule** | The side that matches the real outcome | The outcome that matches the real result | Players whose error < median error |
+| **Payout math** | share = net_bet / winning_pool × losing_pool | Same formula — losing_pool = sum of ALL other pools | weight = (1/(1+r))^6, share = weight/total_weight × prize_pool |
+| **Max return** | ~2x (balanced) | ~Nx where N = outcome count | Depends on winner/loser split |
 
 ---
 
@@ -40,7 +42,7 @@ One Solana program, two market types:
           │  creator, question, type, status       │
           │  fees, deadline, total_bets            │
           │  vault ──────┐                         │
-          │  market_data │ (YesNo OR Accuracy)     │
+          │  market_data │ (YesNo/Multi/Accuracy)  │
           └──────┬───────┼────────────────────────-┘
                  │       │
                  │       ▼
@@ -61,8 +63,8 @@ One Solana program, two market types:
 │         │ │         │ │         │
 │ bettor  │ │ bettor  │ │ bettor  │
 │ bet_data│ │ bet_data│ │ bet_data│
-│ (YesNo  │ │ (YesNo  │ │(Accur-  │
-│  or Acc)│ │  or Acc)│ │  acy)   │
+│(YesNo/ │ │(YesNo/ │ │(Accur-  │
+│Mlt/Acc)│ │Mlt/Acc)│ │  acy)   │
 │ claimed │ │ claimed │ │ claimed │
 └─────────┘ └─────────┘ └─────────┘
 ```
@@ -72,9 +74,11 @@ One Solana program, two market types:
 | Account | Count | PDA Seeds | Approx Size | Rent |
 |---------|-------|-----------|-------------|------|
 | Protocol | 1 total | `["protocol"]` | 83 bytes | ~0.001 SOL |
-| Market | 1 per market | `["market", index]` | 383–428 bytes | ~0.003 SOL |
+| Market | 1 per market | `["market", index]` | 394–823 bytes | ~0.003–0.007 SOL |
 | Vault | 1 per market | `["vault", market_key]` | 165 bytes (SPL) | ~0.002 SOL |
-| Bet | 1 per bet | `["bet", market_key, bet_index]` | 128–148 bytes | ~0.001 SOL |
+| Bet | 1 per bet | `["bet", market_key, bet_index]` | 124–146 bytes | ~0.001 SOL |
+
+Market size varies by type: YesNo (~394), MultiOutcome (~823, largest due to fixed 10-slot arrays), Accuracy (~438).
 
 ---
 
@@ -112,7 +116,7 @@ Creates:
 ### 2. Create Market
 
 ```
-Creator calls: create_market(question, market_type, bond, lp_fee_bps, deadline)
+Creator calls: create_market(question, market_type, bond, lp_fee_bps, deadline, outcomes?)
 
 Reads:  Protocol.market_count → index
 Writes: Protocol.market_count += 1
@@ -120,6 +124,10 @@ Writes: Protocol.market_count += 1
 Creates:
   Market PDA ← all fields, status=Open, market_data based on type
   Vault PDA  ← SPL token account, authority = program PDA
+
+  For MultiOutcome:
+    outcomes must be provided (2–10 labels, each ≤32 bytes)
+    market_data = MultiOutcome { outcome_count, outcome_labels, pools=[0;N], ... }
 
 Transfers:
   creator_bond tokens → Vault
@@ -142,6 +150,31 @@ Creates:
 
 Updates Market:
   market_data.yes_pool += net  (or no_pool)
+  market_data.lp_fee_pool += lp_fee
+  market_data.protocol_fee_pool += protocol_fee
+  total_bets += 1
+
+Transfers:
+  amount tokens → Vault
+```
+
+#### MultiOutcome
+
+```
+Bettor calls: place_bet_multi(outcome_id, amount)
+
+Requires: outcome_id < market_data.outcome_count
+
+Computes:
+  lp_fee       = amount × lp_fee_bps / 10000
+  protocol_fee = amount × protocol_fee_bps / 10000
+  net_amount   = amount - lp_fee - protocol_fee
+
+Creates:
+  Bet PDA ← bettor, outcome_id, total_amount, net_amount, fees
+
+Updates Market:
+  market_data.pools[outcome_id] += net_amount
   market_data.lp_fee_pool += lp_fee
   market_data.protocol_fee_pool += protocol_fee
   total_bets += 1
@@ -189,6 +222,22 @@ Updates Market:
   status = Settled
 ```
 
+#### MultiOutcome — single transaction
+
+```
+Oracle/Creator calls: settle_multi(winning_outcome_id)
+
+Requires: winning_outcome_id < outcome_count
+
+Updates Market:
+  market_data.winning_outcome = Some(winning_outcome_id)
+  status = Settled
+
+Edge case — if pools[winning_outcome_id] == 0 (nobody bet on winner):
+  → Market is voided, all bettors get refunds
+  → OR protocol takes the unclaimed pool (design choice)
+```
+
 #### Accuracy — multi-step (crank)
 
 Accuracy settlement is computationally heavy. It happens in phases:
@@ -231,6 +280,14 @@ YesNo payout:
   winnings = share × losing_pool
   total_return = net_amount + winnings
 
+MultiOutcome payout:
+  winning_pool = pools[winning_outcome_id]
+  losing_pool  = sum(all pools) - winning_pool
+  share = net_amount / winning_pool
+  winnings = share × losing_pool
+  total_return = net_amount + winnings
+  (identical formula to YesNo — losing_pool is just bigger)
+
 Accuracy payout:
   share = weight / total_weight
   winnings = share × prize_pool
@@ -251,6 +308,10 @@ Requires: Market.status == Settled
 
 YesNo:
   Transfers from Vault → Creator: creator_bond + lp_fee_pool
+
+MultiOutcome:
+  Transfers from Vault → Creator: creator_bond + lp_fee_pool
+  (same as YesNo — creator earns LP fees from all bets across all outcomes)
 
 Accuracy:
   Transfers from Vault → Creator: creator_bond
@@ -281,7 +342,7 @@ Solana accounts have a 10MB limit, but more importantly you pay rent per byte. A
 - One whale market with 10k bets makes the account huge
 
 Separate Bet PDAs:
-- Market stays fixed-size (~400 bytes)
+- Market stays fixed-size (~400–823 bytes depending on type)
 - Each bettor pays rent for their own Bet (~0.001 SOL, reclaimable)
 - Bets can be fetched in parallel by the frontend
 - No realloc needed
@@ -303,7 +364,23 @@ Separate Bet PDAs:
 - One program, one Market instruction set — simpler on the frontend
 - Borsh enum serialization is efficient (1-byte tag + fields)
 - Shared fields (creator, status, deadline) aren't duplicated
-- Adding a third market type later = add a new enum variant, not new account types
+- Adding a new market type = add a new enum variant, not new account types (already done: YesNo → MultiOutcome → Accuracy)
+
+### Why fixed-size arrays for MultiOutcome instead of Vec?
+
+On Solana, account size must be known at creation. Options were:
+- **Vec (variable)**: needs `realloc` if outcomes are added. Account size unpredictable.
+- **Separate OutcomePool accounts**: more PDAs, more instructions, more complexity.
+- **Fixed array [u64; 10]** (chosen): outcome_count says how many slots are active. Unused slots = 0. Account size is always the same (~823 bytes). No realloc. Simple indexing.
+
+10 outcomes is generous — most real prediction markets have 2–8. If a market needs more than 10, it should be split into multiple related markets.
+
+### Why outcome_id (u8) in bets instead of outcome label (String)?
+
+- 1 byte vs up to 36 bytes — saves rent on every Bet account
+- Integer comparison is cheaper than string comparison on-chain
+- The label is stored once in the Market account; bets just reference by index
+- Frontend resolves outcome_id → label by reading the Market account
 
 ### Why basis points (bps) instead of percentages?
 
@@ -323,6 +400,14 @@ Solana has no floats. All pool math uses `u64` with `u128` intermediaries to avo
 let share_numerator: u128 = (net_amount as u128) * (losing_pool as u128);
 let payout: u64 = (share_numerator / winning_pool as u128) as u64;
 
+// MultiOutcome payout (identical formula, just compute losing_pool differently)
+let total_pool: u64 = pools.iter().sum();
+let winning_pool: u64 = pools[winning_outcome_id];
+let losing_pool: u64 = total_pool - winning_pool;
+// then same as YesNo:
+let share_numerator: u128 = (net_amount as u128) * (losing_pool as u128);
+let payout: u64 = (share_numerator / winning_pool as u128) as u64;
+
 // Accuracy weight — can't do (1/(1+r))^6 directly
 // Instead, use fixed-point with SCALE = 1_000_000_000 (10^9)
 //
@@ -338,7 +423,7 @@ let payout: u64 = (share_numerator / winning_pool as u128) as u64;
 ```
 src/
 ├── state.rs       ← account structs, enums, sizes (YOU ARE HERE)
-├── flew.rs        ← YesNo math simulation (existing)
+├── flew.rs        ← YesNo + MultiOutcome math simulation (existing)
 ├── trepa.rs       ← Accuracy math simulation (existing)
 ├── main.rs        ← test harness
 └── (future files as you build instructions)
@@ -347,8 +432,10 @@ src/
     │   ├── initialize_protocol.rs
     │   ├── create_market.rs
     │   ├── place_bet_yesno.rs
+    │   ├── place_bet_multi.rs
     │   ├── place_bet_accuracy.rs
     │   ├── settle_yesno.rs
+    │   ├── settle_multi.rs
     │   ├── settle_accuracy.rs
     │   ├── claim.rs
     │   └── void.rs
@@ -390,6 +477,8 @@ src/
 ## Scaling Notes
 
 - **YesNo settlement**: O(1) — just set the winning side. Cheap.
+- **MultiOutcome settlement**: O(1) — just set the winning outcome index. Same cost as YesNo regardless of how many outcomes exist. The fixed array means no iteration needed.
 - **Accuracy settlement**: O(N) — must process every bet to find median and compute weights. For markets with >50 players, use a **crank** pattern: off-chain bot calls `compute_errors` repeatedly, processing ~10 bets per transaction, until all are done.
+- **Max outcomes per multi-market**: 10 (fixed). Keeps account size bounded at ~823 bytes.
 - **Max bets per market**: No hard limit since bets are separate accounts. Practical limit depends on how the frontend fetches them (getProgramAccounts with filters).
 - **Concurrent markets**: Unlimited. Each market is independent.
