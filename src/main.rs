@@ -3,6 +3,6 @@ mod state;
 mod trepa;
 
 fn main() {
-    flew::flew();
-    // trepa::trepa();
+    // flew::flew();
+    trepa::trepa();
 }

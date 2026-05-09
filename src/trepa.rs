@@ -184,6 +184,88 @@ pub fn run_round(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  TIERED LOBBIES
+//
+//  Same players, same outcome, different entry fees.
+//  Each tier is an independent pool — the formula doesn't change.
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+pub struct Tier {
+    pub name: String,
+    pub entry_fee: f64,
+}
+
+#[derive(Debug)]
+pub struct TieredResult {
+    pub tier_name: String,
+    pub entry_fee: f64,
+    pub result: RoundResult,
+}
+
+pub fn run_tiered(
+    players: Vec<Player>,
+    outcome: f64,
+    tiers: Vec<Tier>,
+    protocol_fee_percent: f64,
+) -> Vec<TieredResult> {
+    tiers
+        .into_iter()
+        .map(|tier| {
+            let result = run_round(
+                players.clone(),
+                outcome,
+                tier.entry_fee,
+                protocol_fee_percent,
+            );
+            TieredResult {
+                tier_name: tier.name,
+                entry_fee: tier.entry_fee,
+                result,
+            }
+        })
+        .collect()
+}
+
+fn print_round(label: &str, result: &RoundResult) {
+    println!("\n==============================");
+    println!("{}", label);
+    println!("==============================");
+
+    println!("Outcome: {}", result.outcome);
+    println!("Median Error: {}", result.median_error);
+    println!("Players: {}", result.total_players);
+    println!("Winners: {}", result.winners);
+    println!("Losers: {}", result.losers);
+
+    println!("\n--- POOL FLOW ---");
+    println!("Total Pool: ${:.2}", result.total_pool);
+    println!("Loser Pool: ${:.2}", result.loser_pool);
+    println!("Protocol Take: ${:.2}", result.protocol_take);
+    println!("Prize Pool: ${:.2}", result.prize_pool);
+
+    println!("\n--- PLAYER RESULTS ---");
+
+    for r in result.results.iter() {
+        println!("-----------------------------------");
+        println!("Player: {}", r.name);
+        println!("Estimate: {}", r.estimate);
+        println!("Error: {}", r.error);
+        println!("Won: {}", r.won);
+
+        if r.won {
+            println!("Relative Error: {:.4}", r.relative_error);
+            println!("Weight: {:.6}", r.weight);
+            println!("Entry Returned: ${:.2}", r.entry_returned);
+            println!("Profit Share: ${:.2}", r.profit_share);
+            println!("Final Payout: ${:.2}", r.final_payout);
+        } else {
+            println!("Final Payout: $0.00");
+        }
+    }
+}
+
 pub fn trepa() {
     let players = vec![
         Player {
@@ -230,58 +312,66 @@ pub fn trepa() {
 
     let outcome = 100_000.0;
 
-    let result = run_round(
-        players, outcome, 1.0,  // entry fee
-        0.20, // 20% protocol fee
-    );
+    // ─── SINGLE ROUND (original example) ───
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║              ACCURACY MARKET — SINGLE ROUND                ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
 
+    let result = run_round(players.clone(), outcome, 1.0, 0.20);
+    print_round("TREPA ROUND RESULT (entry: $1.00)", &result);
+
+    // ─── TIERED LOBBIES ───
+    println!("\n\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║              ACCURACY MARKET — TIERED LOBBIES              ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    let tiers = vec![
+        Tier { name: "Bronze".to_string(), entry_fee: 1.0 },
+        Tier { name: "Silver".to_string(), entry_fee: 10.0 },
+        Tier { name: "Gold".to_string(), entry_fee: 100.0 },
+    ];
+
+    let tiered_results = run_tiered(players, outcome, tiers, 0.20);
+
+    // ─── Side-by-side comparison ───
     println!("\n==============================");
-    println!("TREPA ROUND RESULT");
+    println!("TIERED COMPARISON");
     println!("==============================");
+    println!(
+        "{:<8} {:<12} {:<12} {:<12} {:<12}",
+        "Tier", "Entry Fee", "Total Pool", "Prize Pool", "Proto Take"
+    );
+    println!("{}", "-".repeat(56));
+    for t in &tiered_results {
+        println!(
+            "{:<8} ${:<11.2} ${:<11.2} ${:<11.2} ${:<11.2}",
+            t.tier_name, t.entry_fee, t.result.total_pool, t.result.prize_pool, t.result.protocol_take
+        );
+    }
 
-    println!("Outcome: {}", result.outcome);
-
-    println!("Median Error: {}", result.median_error);
-
-    println!("Players: {}", result.total_players);
-
-    println!("Winners: {}", result.winners);
-    println!("Losers: {}", result.losers);
-
-    println!("\n--- POOL FLOW ---");
-
-    println!("Total Pool: ${:.2}", result.total_pool);
-
-    println!("Loser Pool: ${:.2}", result.loser_pool);
-
-    println!("Protocol Take: ${:.2}", result.protocol_take);
-
-    println!("Prize Pool: ${:.2}", result.prize_pool);
-
-    println!("\n--- PLAYER RESULTS ---");
-
-    for r in result.results.iter() {
-        println!("-----------------------------------");
-        println!("Player: {}", r.name);
-
-        println!("Estimate: {}", r.estimate);
-
-        println!("Error: {}", r.error);
-
-        println!("Won: {}", r.won);
-
-        if r.won {
-            println!("Relative Error: {:.4}", r.relative_error);
-
-            println!("Weight: {:.6}", r.weight);
-
-            println!("Entry Returned: ${:.2}", r.entry_returned);
-
-            println!("Profit Share: ${:.2}", r.profit_share);
-
-            println!("Final Payout: ${:.2}", r.final_payout);
-        } else {
-            println!("Final Payout: $0.00");
+    println!(
+        "\n{:<8} {:<8} {:<12} {:<12} {:<10}",
+        "Tier", "Player", "Payout", "Profit", "ROI"
+    );
+    println!("{}", "-".repeat(50));
+    for t in &tiered_results {
+        for r in &t.result.results {
+            if r.won {
+                let profit = r.final_payout - t.entry_fee;
+                let roi = (profit / t.entry_fee) * 100.0;
+                println!(
+                    "{:<8} {:<8} ${:<11.2} ${:<11.2} {:<.1}%",
+                    t.tier_name, r.name, r.final_payout, profit, roi
+                );
+            }
         }
+    }
+
+    // ─── Full detail per tier ───
+    for t in &tiered_results {
+        print_round(
+            &format!("{} TIER (entry: ${:.2})", t.tier_name.to_uppercase(), t.entry_fee),
+            &t.result,
+        );
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::trepa::{Player, Tier, run_tiered};
+
 const LP_FEE_PERCENTAGE: f64 = 0.015;
 const PROTOCOL_FEE_PERCENTAGE: f64 = 0.005;
 const NET_PERCENT: f64 = 0.98;
@@ -447,4 +449,71 @@ pub fn flew() {
     multi.print_state();
     multi.settle("Solana");
     multi.payout();
+
+    // ─── TIERED ACCURACY MARKET ───
+    println!("\n\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║         TIERED ACCURACY MARKET EXAMPLE                     ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("Question: What will BTC price be at midnight UTC June 1st?");
+    println!("Outcome:  $100,000\n");
+
+    let players = vec![
+        Player { name: "alice".to_string(), estimate: 99_950.0 },
+        Player { name: "bob".to_string(), estimate: 99_800.0 },
+        Player { name: "carol".to_string(), estimate: 99_500.0 },
+        Player { name: "dan".to_string(), estimate: 99_000.0 },
+        Player { name: "eve".to_string(), estimate: 98_000.0 },
+        Player { name: "frank".to_string(), estimate: 95_000.0 },
+    ];
+
+    let tiers = vec![
+        Tier { name: "Bronze".to_string(), entry_fee: 1.0 },
+        Tier { name: "Silver".to_string(), entry_fee: 10.0 },
+        Tier { name: "Gold".to_string(), entry_fee: 100.0 },
+        Tier { name: "Diamond".to_string(), entry_fee: 1000.0 },
+    ];
+
+    let results = run_tiered(players, 100_000.0, tiers, 0.20);
+
+    println!(
+        "{:<10} {:<10} {:<12} {:<12} {:<12} {:<12}",
+        "Tier", "Fee", "Total Pool", "Loser Pool", "Proto Take", "Prize Pool"
+    );
+    println!("{}", "─".repeat(68));
+    for t in &results {
+        println!(
+            "{:<10} ${:<9.2} ${:<11.2} ${:<11.2} ${:<11.2} ${:<11.2}",
+            t.tier_name,
+            t.entry_fee,
+            t.result.total_pool,
+            t.result.loser_pool,
+            t.result.protocol_take,
+            t.result.prize_pool
+        );
+    }
+
+    println!(
+        "\n{:<10} {:<8} {:<10} {:<12} {:<12} {:<8}",
+        "Tier", "Player", "Estimate", "Payout", "Profit", "ROI"
+    );
+    println!("{}", "─".repeat(60));
+    for t in &results {
+        for r in &t.result.results {
+            let profit = r.final_payout - t.entry_fee;
+            let roi = if r.won {
+                format!("{:+.1}%", (profit / t.entry_fee) * 100.0)
+            } else {
+                "-100%".to_string()
+            };
+            println!(
+                "{:<10} {:<8} {:<10.0} ${:<11.2} ${:<11.2} {}",
+                t.tier_name,
+                r.name,
+                r.estimate,
+                r.final_payout,
+                profit,
+                roi
+            );
+        }
+    }
 }
