@@ -1,6 +1,12 @@
+use std::collections::HashMap;
+
 const LP_FEE_PERCENTAGE: f64 = 0.015;
 const PROTOCOL_FEE_PERCENTAGE: f64 = 0.005;
 const NET_PERCENT: f64 = 0.98;
+
+// ═══════════════════════════════════════════════════════════════════
+//  YES/NO MARKET (original)
+// ═══════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Side {
@@ -194,7 +200,220 @@ impl Market {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  MULTI-OUTCOME MARKET
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+struct MultiBet {
+    bettor: String,
+    outcome: String,
+    total_amount: f64,
+    net_amount: f64,
+    lp_fee: f64,
+    protocol_fee: f64,
+}
+
+#[derive(Debug)]
+pub struct MultiMarket {
+    creator: String,
+    question: String,
+    creator_bond: f64,
+    outcomes: Vec<String>,
+    bets: Vec<MultiBet>,
+    pools: HashMap<String, f64>,
+    lp_fee_pool: f64,
+    protocol_fee_pool: f64,
+    settled: bool,
+    winning_outcome: Option<String>,
+}
+
+impl MultiMarket {
+    pub fn new(creator: &str, question: &str, creator_bond: f64, outcomes: Vec<&str>) -> Self {
+        let mut pools = HashMap::new();
+        let outcome_strings: Vec<String> = outcomes.iter().map(|o| o.to_string()).collect();
+        for outcome in &outcome_strings {
+            pools.insert(outcome.clone(), 0.0);
+        }
+
+        Self {
+            creator: creator.to_string(),
+            question: question.to_string(),
+            creator_bond,
+            outcomes: outcome_strings,
+            bets: vec![],
+            pools,
+            lp_fee_pool: 0.0,
+            protocol_fee_pool: 0.0,
+            settled: false,
+            winning_outcome: None,
+        }
+    }
+
+    pub fn place_bet(&mut self, bettor: &str, outcome: &str, amount: f64) {
+        if !self.pools.contains_key(outcome) {
+            println!("Invalid outcome: {}", outcome);
+            return;
+        }
+
+        let lp_fee = amount * LP_FEE_PERCENTAGE;
+        let protocol_fee = amount * PROTOCOL_FEE_PERCENTAGE;
+        let net_amount = amount * NET_PERCENT;
+
+        let bet = MultiBet {
+            bettor: bettor.to_string(),
+            outcome: outcome.to_string(),
+            total_amount: amount,
+            net_amount,
+            lp_fee,
+            protocol_fee,
+        };
+
+        *self.pools.get_mut(outcome).unwrap() += net_amount;
+        self.lp_fee_pool += lp_fee;
+        self.protocol_fee_pool += protocol_fee;
+        self.bets.push(bet);
+    }
+
+    pub fn settle(&mut self, winning_outcome: &str) {
+        if !self.pools.contains_key(winning_outcome) {
+            println!("Invalid outcome: {}", winning_outcome);
+            return;
+        }
+        self.settled = true;
+        self.winning_outcome = Some(winning_outcome.to_string());
+    }
+
+    pub fn payout(&self) {
+        if !self.settled {
+            println!("Market not settled");
+            return;
+        }
+
+        let winner = self.winning_outcome.as_ref().unwrap();
+        let winning_pool = self.pools[winner];
+
+        let total_pool: f64 = self.pools.values().sum();
+        let losing_pool = total_pool - winning_pool;
+
+        println!("\n=============================== Multi-Outcome Payouts ====================================");
+        println!("Winning Outcome : {}", winner);
+        println!("Winning Pool    : {:.3}", winning_pool);
+        println!("Losing Pool     : {:.3}", losing_pool);
+
+        // --- edge case: nobody bet on the winner ---
+        if winning_pool == 0.0 {
+            println!("\nNO ONE BET ON THE WINNING OUTCOME!");
+            println!("All bettors lose. Pool goes unclaimed.");
+            println!("Protocol keeps fees: {:.3}", self.protocol_fee_pool);
+            println!("Creator keeps bond + LP fees: {:.3}", self.creator_bond + self.lp_fee_pool);
+            println!("====================================");
+            return;
+        }
+
+        // --- Winner payouts ---
+        println!("\n--- Winner Payouts ---");
+        for bet in &self.bets {
+            if bet.outcome == *winner {
+                let share = bet.net_amount / winning_pool;
+                let winnings = share * losing_pool;
+                let total_return = bet.net_amount + winnings;
+                let profit = total_return - bet.total_amount;
+
+                println!("Winner : {}", bet.bettor);
+                println!("Picked : {}", bet.outcome);
+                println!("Net Bet : {:.3}", bet.net_amount);
+                println!("Share of winning pool : {:.2}%", share * 100.0);
+                println!("Winnings from losers  : {:.3}", winnings);
+                println!("Total Return          : {:.3}", total_return);
+                println!("Profit (return - orig): {:.3}", profit);
+                println!("------------------------------------");
+            }
+        }
+
+        // --- Loser losses ---
+        println!("\n--- Loser Losses ---");
+        for bet in &self.bets {
+            if bet.outcome != *winner {
+                let fees_paid = bet.lp_fee + bet.protocol_fee;
+                println!("Loser : {}", bet.bettor);
+                println!("Picked : {}", bet.outcome);
+                println!("Original Bet          : {:.3}", bet.total_amount);
+                println!("Net Bet (went to pool) : {:.3}", bet.net_amount);
+                println!("Fees Paid (LP + Proto) : {:.3}", fees_paid);
+                println!("Total Lost             : {:.3}", bet.total_amount);
+                println!("------------------------------------");
+            }
+        }
+
+        // --- Protocol profit ---
+        println!("\n--- Protocol Profit ---");
+        println!("Protocol Fee Collected : {:.3}", self.protocol_fee_pool);
+        println!("------------------------------------");
+
+        // --- Market Creator profit ---
+        let creator_payout = self.creator_bond + self.lp_fee_pool;
+        let creator_profit = self.lp_fee_pool;
+
+        println!("\n--- Market Creator: {} ---", self.creator);
+        println!("Bond Deposited         : {:.3}", self.creator_bond);
+        println!("LP Fees Earned         : {:.3}", self.lp_fee_pool);
+        println!("Total Payout           : {:.3} (bond + LP fees)", creator_payout);
+        println!("Creator Profit         : {:.3}", creator_profit);
+        println!("====================================");
+    }
+
+    pub fn print_state(&self) {
+        println!("\n=============================== Multi-Outcome Market State ==============================");
+        println!("Question      : {}", self.question);
+        println!("Creator       : {}", self.creator);
+        println!("Creator Bond  : {:.3}", self.creator_bond);
+        println!("Outcomes      : {:?}", self.outcomes);
+
+        let total_pool: f64 = self.pools.values().sum();
+
+        println!("\nPools:");
+        for outcome in &self.outcomes {
+            let pool = self.pools[outcome];
+            let prob = if total_pool > 0.0 {
+                (pool / total_pool) * 100.0
+            } else {
+                0.0
+            };
+            println!("  {:<15} : {:.3}  ({:.2}%)", outcome, pool, prob);
+        }
+
+        println!("\nLP Fee Pool   : {:.3}", self.lp_fee_pool);
+        println!("Protocol Fee  : {:.3}", self.protocol_fee_pool);
+        println!("Total Bets    : {}", self.bets.len());
+        println!("Settled       : {}", self.settled);
+        if let Some(ref winner) = self.winning_outcome {
+            println!("Winner        : {}", winner);
+        }
+
+        println!("\nBets:");
+        for (i, bet) in self.bets.iter().enumerate() {
+            println!(
+                "  #{}: {} bet \"{}\" — total: {:.3}, net: {:.3}, lp_fee: {:.3}, protocol_fee: {:.3}",
+                i + 1,
+                bet.bettor,
+                bet.outcome,
+                bet.total_amount,
+                bet.net_amount,
+                bet.lp_fee,
+                bet.protocol_fee
+            );
+        }
+        println!("===========================================================================");
+    }
+}
+
 pub fn flew() {
+    // ─── YES/NO MARKET (original example) ───
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║              YES/NO MARKET EXAMPLE                         ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
     let mut market = Market::new("alice", "Will BTC hit 100k by end of 2026?", 10.0);
 
     market.place_bet("bob", Side::Yes, 10.0);
@@ -204,8 +423,28 @@ pub fn flew() {
     market.place_bet("Frank", Side::Yes, 8.0);
 
     market.print_state();
-
     market.settle(Side::Yes);
-
     market.payout();
+
+    // ─── MULTI-OUTCOME MARKET (new example) ───
+    println!("\n\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║           MULTI-OUTCOME MARKET EXAMPLE                     ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    let mut multi = MultiMarket::new(
+        "alice",
+        "Which chain will have the highest TVL by end of 2026?",
+        10.0,
+        vec!["Ethereum", "Solana", "Arbitrum", "Base"],
+    );
+
+    multi.place_bet("alice", "Ethereum", 50.0);
+    multi.place_bet("bob", "Solana", 30.0);
+    multi.place_bet("carol", "Solana", 20.0);
+    multi.place_bet("dan", "Arbitrum", 40.0);
+    multi.place_bet("eve", "Base", 10.0);
+
+    multi.print_state();
+    multi.settle("Solana");
+    multi.payout();
 }
